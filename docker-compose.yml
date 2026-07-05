@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-life_helper}
+      POSTGRES_USER: ${POSTGRES_USER:-life_helper}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      TZ: ${TZ:-Europe/Minsk}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-life_helper}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-life_helper}
+      TZ: ${TZ:-Europe/Minsk}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
