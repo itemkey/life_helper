@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from html import escape
 
-from app.db.models import ShoppingItem, ShoppingList
+from app.db.models import ListMember, ShoppingItem, ShoppingList, User
 from app.services.access import AccessLevel
 
 
@@ -55,6 +55,38 @@ def format_list_text(
         for index, item in enumerate(items, start=1):
             mark = "✓" if item.is_done else "□"
             lines.append(f"{index}. {mark} {escape(item.text)}")
+    return "\n".join(lines)
+
+
+def _format_user_name(user: User) -> str:
+    full_name = " ".join(part for part in (user.first_name, user.last_name) if part)
+    if full_name and user.username:
+        return f"{escape(full_name)} (@{escape(user.username)})"
+    if full_name:
+        return escape(full_name)
+    if user.username:
+        return f"@{escape(user.username)}"
+    return f"ID {user.id}"
+
+
+def format_members_text(
+    shopping_list: ShoppingList,
+    owner: User,
+    members: Sequence[tuple[ListMember, User]],
+) -> str:
+    lines = [
+        f"<b>Участники списка «{escape(shopping_list.title)}»</b>",
+        "",
+        f"Владелец: {_format_user_name(owner)}",
+    ]
+    if not members:
+        lines.append("Участников по ссылке пока нет.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("Участники:")
+    for index, (_, user) in enumerate(members, start=1):
+        lines.append(f"{index}. {_format_user_name(user)}")
     return "\n".join(lines)
 
 

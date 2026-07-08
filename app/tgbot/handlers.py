@@ -20,10 +20,18 @@ from app.tgbot.keyboards import (
     home_keyboard,
     list_keyboard,
     lists_keyboard,
+    members_keyboard,
     settings_keyboard,
 )
 from app.tgbot.states import ShoppingListStates
-from app.tgbot.texts import HELP_TEXT, WELCOME_TEXT, format_list_text, format_lists_text, format_settings_text
+from app.tgbot.texts import (
+    HELP_TEXT,
+    WELCOME_TEXT,
+    format_list_text,
+    format_lists_text,
+    format_members_text,
+    format_settings_text,
+)
 
 router = Router(name="shopping")
 logger = logging.getLogger(__name__)
@@ -143,6 +151,20 @@ async def _show_settings(target: Message | CallbackQuery, session: AsyncSession,
     await _clear_current_list_view(target, session, user_id)
     shopping_list = await shopping.assert_owner(session, owner_id=user_id, list_id=list_id)
     await _send_or_edit(target, format_settings_text(shopping_list), reply_markup=settings_keyboard(shopping_list))
+
+
+async def _show_members(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
+    await _clear_current_list_view(target, session, user_id)
+    shopping_list, owner, members, _ = await shopping.get_list_members_view(
+        session,
+        user_id=user_id,
+        list_id=list_id,
+    )
+    await _send_or_edit(
+        target,
+        format_members_text(shopping_list, owner, members),
+        reply_markup=members_keyboard(shopping_list),
+    )
 
 
 async def _handle_service_error(target: Message | CallbackQuery, error: Exception) -> None:
@@ -322,6 +344,19 @@ async def callback_refresh_list(query: CallbackQuery, session: AsyncSession) -> 
         return
     try:
         await _show_list(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("members:"))
+async def callback_members(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "members:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_members(query, session, user_id, list_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 

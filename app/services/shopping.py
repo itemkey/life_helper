@@ -87,6 +87,27 @@ async def get_list_view(
     return shopping_list, items.all(), level
 
 
+async def get_list_members_view(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    list_id: int,
+) -> tuple[ShoppingList, User, Sequence[tuple[ListMember, User]], AccessLevel]:
+    shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
+    owner = await session.get(User, shopping_list.owner_id)
+    if owner is None:
+        raise ListNotFound("Владелец списка не найден.")
+
+    members_result = await session.execute(
+        select(ListMember, User)
+        .join(User, User.id == ListMember.user_id)
+        .where(ListMember.list_id == list_id)
+        .order_by(ListMember.joined_at.asc(), ListMember.user_id.asc())
+    )
+    members = [(member, member_user) for member, member_user in members_result.all()]
+    return shopping_list, owner, members, level
+
+
 async def save_list_view_message(
     session: AsyncSession,
     *,

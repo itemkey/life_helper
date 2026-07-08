@@ -8,6 +8,7 @@ from app.db.models import ListViewMessage
 from app.services import shopping
 from app.tgbot.handlers import (
     callback_delete_item,
+    callback_members,
     callback_refresh_list,
     callback_toggle_item,
     cmd_start,
@@ -145,6 +146,30 @@ async def test_refresh_list_edits_message_and_saves_view(session):
     assert view_message is not None
     assert view_message.chat_id == 1000
     assert view_message.message_id == 10
+
+
+async def test_members_button_edits_message_with_list_members(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="owner", first_name="Owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="member", first_name="Member"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    await shopping.save_list_view_message(session, list_id=shopping_list.id, user_id=200, chat_id=2000, message_id=20)
+    query = FakeCallback(
+        from_user=FakeTelegramUser(id=200, username="member", first_name="Member"),
+        data=f"members:{shopping_list.id}",
+        message=FakeEditableMessage(chat=FakeChat(2000), message_id=20),
+    )
+
+    await callback_members(query, session)
+
+    assert query.message is not None
+    assert query.message.edits
+    text = query.message.edits[0][0]
+    assert "Участники списка" in text
+    assert "Owner (@owner)" in text
+    assert "Member (@member)" in text
+    assert await session.get(ListViewMessage, (shopping_list.id, 200)) is None
 
 
 async def test_add_items_broadcasts_public_list_update_to_other_viewers(session):

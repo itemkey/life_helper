@@ -71,10 +71,19 @@ def list_keyboard(
 
     rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"refresh:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Добавить покупку", callback_data=f"add:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Участники списка", callback_data=f"members:{shopping_list.id}")])
     if level == AccessLevel.owner:
         rows.append([InlineKeyboardButton(text="Настройки", callback_data=f"settings:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="К спискам", callback_data="lists")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def members_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Назад к списку", callback_data=f"open:{shopping_list.id}")],
+        ]
+    )
 
 
 def settings_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:

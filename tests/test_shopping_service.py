@@ -115,3 +115,22 @@ async def test_public_update_view_only_returns_owner_and_active_members(session)
 
     assert await shopping.get_public_list_update_view(session, list_id=shopping_list.id) is None
     assert await session.get(ListViewMessage, (shopping_list.id, 200)) is None
+
+
+async def test_get_list_members_view_returns_owner_and_joined_members(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="owner", first_name="Owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="member", first_name="Member"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+
+    view, owner, members, level = await shopping.get_list_members_view(
+        session,
+        user_id=200,
+        list_id=shopping_list.id,
+    )
+
+    assert view.id == shopping_list.id
+    assert owner.id == 100
+    assert level == AccessLevel.member
+    assert [(member.user_id, member_user.username) for member, member_user in members] == [(200, "member")]
