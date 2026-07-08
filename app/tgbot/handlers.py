@@ -21,6 +21,7 @@ from app.tgbot.keyboards import (
     list_keyboard,
     lists_keyboard,
     members_keyboard,
+    members_management_keyboard,
     settings_keyboard,
 )
 from app.tgbot.states import ShoppingListStates
@@ -29,6 +30,7 @@ from app.tgbot.texts import (
     WELCOME_TEXT,
     format_list_text,
     format_lists_text,
+    format_members_management_text,
     format_members_text,
     format_settings_text,
 )
@@ -85,6 +87,18 @@ def _parse_id(value: str | None, prefix: str) -> int | None:
         return None
     try:
         return int(value.removeprefix(prefix))
+    except ValueError:
+        return None
+
+
+def _parse_two_ids(value: str | None, prefix: str) -> tuple[int, int] | None:
+    if not value or not value.startswith(prefix):
+        return None
+    parts = value.removeprefix(prefix).split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
     except ValueError:
         return None
 
@@ -155,7 +169,7 @@ async def _show_settings(target: Message | CallbackQuery, session: AsyncSession,
 
 async def _show_members(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
     await _clear_current_list_view(target, session, user_id)
-    shopping_list, owner, members, _ = await shopping.get_list_members_view(
+    shopping_list, owner, members, level = await shopping.get_list_members_view(
         session,
         user_id=user_id,
         list_id=list_id,
@@ -163,7 +177,29 @@ async def _show_members(target: Message | CallbackQuery, session: AsyncSession, 
     await _send_or_edit(
         target,
         format_members_text(shopping_list, owner, members),
-        reply_markup=members_keyboard(shopping_list),
+        reply_markup=members_keyboard(shopping_list, level),
+    )
+
+
+async def _show_manage_members(
+    target: Message | CallbackQuery,
+    session: AsyncSession,
+    owner_id: int,
+    list_id: int,
+    *,
+    ack: bool = True,
+) -> None:
+    await _clear_current_list_view(target, session, owner_id)
+    shopping_list, members = await shopping.get_manageable_list_members_view(
+        session,
+        owner_id=owner_id,
+        list_id=list_id,
+    )
+    await _send_or_edit(
+        target,
+        format_members_management_text(shopping_list, members),
+        reply_markup=members_management_keyboard(shopping_list, members),
+        ack=ack,
     )
 
 
@@ -357,6 +393,61 @@ async def callback_members(query: CallbackQuery, session: AsyncSession) -> None:
         return
     try:
         await _show_members(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("members_manage:"))
+async def callback_members_manage(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "members_manage:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_manage_members(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("member_remove:"))
+async def callback_member_remove(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    ids = _parse_two_ids(query.data, "member_remove:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    list_id, member_user_id = ids
+    try:
+        await shopping.remove_list_member(
+            session,
+            owner_id=user_id,
+            list_id=list_id,
+            member_user_id=member_user_id,
+        )
+        await _answer_callback(query, "Участник удален.")
+        await _show_manage_members(query, session, user_id, list_id, ack=False)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("member_ban:"))
+async def callback_member_ban(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    ids = _parse_two_ids(query.data, "member_ban:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    list_id, member_user_id = ids
+    try:
+        await shopping.ban_list_member(
+            session,
+            owner_id=user_id,
+            list_id=list_id,
+            member_user_id=member_user_id,
+        )
+        await _answer_callback(query, "Участник забанен.")
+        await _show_manage_members(query, session, user_id, list_id, ack=False)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 

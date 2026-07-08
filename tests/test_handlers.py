@@ -9,6 +9,9 @@ from app.services import shopping
 from app.tgbot.handlers import (
     callback_delete_item,
     callback_members,
+    callback_members_manage,
+    callback_member_ban,
+    callback_member_remove,
     callback_refresh_list,
     callback_toggle_item,
     cmd_start,
@@ -170,6 +173,71 @@ async def test_members_button_edits_message_with_list_members(session):
     assert "Owner (@owner)" in text
     assert "Member (@member)" in text
     assert await session.get(ListViewMessage, (shopping_list.id, 200)) is None
+
+
+async def test_owner_can_open_members_management(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="owner", first_name="Owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="member", first_name="Member"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    query = FakeCallback(
+        from_user=FakeTelegramUser(id=100, username="owner", first_name="Owner"),
+        data=f"members_manage:{shopping_list.id}",
+        message=FakeEditableMessage(chat=FakeChat(1000), message_id=10),
+    )
+
+    await callback_members_manage(query, session)
+
+    assert query.message is not None
+    assert query.message.edits
+    text, keyboard = query.message.edits[0]
+    assert "Управление участниками" in text
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    assert any(button.callback_data == f"member_remove:{shopping_list.id}:200" for button in buttons)
+    assert any(button.callback_data == f"member_ban:{shopping_list.id}:200" for button in buttons)
+
+
+async def test_owner_can_remove_member_from_members_management(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="owner", first_name="Owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="member", first_name="Member"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    query = FakeCallback(
+        from_user=FakeTelegramUser(id=100, username="owner", first_name="Owner"),
+        data=f"member_remove:{shopping_list.id}:200",
+        message=FakeEditableMessage(chat=FakeChat(1000), message_id=10),
+    )
+
+    await callback_member_remove(query, session)
+
+    assert ("Участник удален.", False) in query.answers
+    assert query.message is not None
+    assert "Участников по ссылке пока нет." in query.message.edits[-1][0]
+    _, _, members, _ = await shopping.get_list_members_view(session, user_id=100, list_id=shopping_list.id)
+    assert members == []
+    assert await shopping.join_public_list_by_token(session, user_id=200, token=token) is not None
+
+
+async def test_owner_can_ban_member_from_members_management(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="owner", first_name="Owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="member", first_name="Member"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    query = FakeCallback(
+        from_user=FakeTelegramUser(id=100, username="owner", first_name="Owner"),
+        data=f"member_ban:{shopping_list.id}:200",
+        message=FakeEditableMessage(chat=FakeChat(1000), message_id=10),
+    )
+
+    await callback_member_ban(query, session)
+
+    assert ("Участник забанен.", False) in query.answers
+    assert query.message is not None
+    assert "Участников по ссылке пока нет." in query.message.edits[-1][0]
+    assert await shopping.join_public_list_by_token(session, user_id=200, token=token) is None
 
 
 async def test_add_items_broadcasts_public_list_update_to_other_viewers(session):

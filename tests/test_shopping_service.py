@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.db.models import ListViewMessage
+from app.db.models import ListBannedMember, ListViewMessage
 from app.services import shopping
 from app.services.access import AccessLevel
 from app.services.errors import AccessDenied, ValidationError
@@ -134,3 +134,47 @@ async def test_get_list_members_view_returns_owner_and_joined_members(session):
     assert owner.id == 100
     assert level == AccessLevel.member
     assert [(member.user_id, member_user.username) for member, member_user in members] == [(200, "member")]
+
+
+async def test_owner_can_remove_member_without_banning(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    await shopping.save_list_view_message(session, list_id=shopping_list.id, user_id=200, chat_id=20, message_id=2)
+
+    await shopping.remove_list_member(session, owner_id=100, list_id=shopping_list.id, member_user_id=200)
+
+    with pytest.raises(AccessDenied):
+        await shopping.get_list_view(session, user_id=200, list_id=shopping_list.id)
+    assert await session.get(ListViewMessage, (shopping_list.id, 200)) is None
+    assert await shopping.join_public_list_by_token(session, user_id=200, token=token) is not None
+
+
+async def test_owner_can_ban_member_and_block_rejoin(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+
+    await shopping.ban_list_member(session, owner_id=100, list_id=shopping_list.id, member_user_id=200)
+
+    with pytest.raises(AccessDenied):
+        await shopping.get_list_view(session, user_id=200, list_id=shopping_list.id)
+    assert await session.get(ListBannedMember, (shopping_list.id, 200)) is not None
+    assert await shopping.join_public_list_by_token(session, user_id=200, token=token) is None
+
+
+async def test_member_cannot_manage_other_members(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    await shopping.upsert_user(session, FakeTelegramUser(id=300))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    await shopping.join_public_list_by_token(session, user_id=300, token=token)
+
+    with pytest.raises(AccessDenied):
+        await shopping.remove_list_member(session, owner_id=200, list_id=shopping_list.id, member_user_id=300)

@@ -90,6 +90,24 @@ def format_members_text(
     return "\n".join(lines)
 
 
+def format_members_management_text(
+    shopping_list: ShoppingList,
+    members: Sequence[tuple[ListMember, User]],
+) -> str:
+    lines = [
+        f"<b>Управление участниками «{escape(shopping_list.title)}»</b>",
+        "",
+    ]
+    if not members:
+        lines.append("Участников по ссылке пока нет.")
+        return "\n".join(lines)
+
+    lines.append("Выбери действие для участника:")
+    for index, (_, user) in enumerate(members, start=1):
+        lines.append(f"{index}. {_format_user_name(user)}")
+    return "\n".join(lines)
+
+
 def format_settings_text(shopping_list: ShoppingList) -> str:
     visibility = "публичный" if shopping_list.is_public else "приватный"
     return (

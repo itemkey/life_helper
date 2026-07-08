@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.db.models import ShoppingItem, ShoppingList
+from app.db.models import ListMember, ShoppingItem, ShoppingList, User
 from app.services.access import AccessLevel
 
 
@@ -13,6 +13,17 @@ def _short(text: str, limit: int = 42) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 1] + "..."
+
+
+def _user_label(user: User, limit: int = 32) -> str:
+    full_name = " ".join(part for part in (user.first_name, user.last_name) if part)
+    if full_name and user.username:
+        return _short(f"{full_name} (@{user.username})", limit)
+    if full_name:
+        return _short(full_name, limit)
+    if user.username:
+        return _short(f"@{user.username}", limit)
+    return f"ID {user.id}"
 
 
 def home_keyboard() -> InlineKeyboardMarkup:
@@ -78,12 +89,31 @@ def list_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def members_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Назад к списку", callback_data=f"open:{shopping_list.id}")],
-        ]
-    )
+def members_keyboard(shopping_list: ShoppingList, level: AccessLevel) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if level == AccessLevel.owner:
+        rows.append([InlineKeyboardButton(text="Управлять участниками", callback_data=f"members_manage:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Назад к списку", callback_data=f"open:{shopping_list.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def members_management_keyboard(
+    shopping_list: ShoppingList,
+    members: Sequence[tuple[ListMember, User]],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for _, user in members:
+        label = _user_label(user)
+        rows.append(
+            [InlineKeyboardButton(text=f"Удалить: {label}", callback_data=f"member_remove:{shopping_list.id}:{user.id}")]
+        )
+        rows.append(
+            [InlineKeyboardButton(text=f"Забанить: {label}", callback_data=f"member_ban:{shopping_list.id}:{user.id}")]
+        )
+
+    rows.append([InlineKeyboardButton(text="Назад к участникам", callback_data=f"members:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Назад к списку", callback_data=f"open:{shopping_list.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def settings_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:

@@ -39,6 +39,10 @@ class User(TimestampMixin, Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    banned_memberships: Mapped[list[ListBannedMember]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 
 class ShoppingList(TimestampMixin, Base):
@@ -67,6 +71,10 @@ class ShoppingList(TimestampMixin, Base):
         cascade="all, delete-orphan",
     )
     view_messages: Mapped[list[ListViewMessage]] = relationship(
+        back_populates="shopping_list",
+        cascade="all, delete-orphan",
+    )
+    banned_members: Mapped[list[ListBannedMember]] = relationship(
         back_populates="shopping_list",
         cascade="all, delete-orphan",
     )
@@ -138,3 +146,27 @@ class ListMember(Base):
 
     shopping_list: Mapped[ShoppingList] = relationship(back_populates="members")
     user: Mapped[User] = relationship()
+
+
+class ListBannedMember(Base):
+    __tablename__ = "list_banned_members"
+    __table_args__ = (UniqueConstraint("list_id", "user_id", name="uq_list_banned_members_list_id_user_id"),)
+
+    list_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("shopping_lists.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    banned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    shopping_list: Mapped[ShoppingList] = relationship(back_populates="banned_members")
+    user: Mapped[User] = relationship(back_populates="banned_memberships")

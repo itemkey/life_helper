@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import ListMember, ListViewMessage, ShoppingItem, ShoppingList, User
+from app.db.models import ListBannedMember, ListMember, ListViewMessage, ShoppingItem, ShoppingList, User
 from app.services.access import AccessLevel, require_access
 from app.services.errors import AccessDenied, ListNotFound, ValidationError
 from app.services.tokens import generate_public_token, hash_public_token
@@ -106,6 +106,23 @@ async def get_list_members_view(
     )
     members = [(member, member_user) for member, member_user in members_result.all()]
     return shopping_list, owner, members, level
+
+
+async def get_manageable_list_members_view(
+    session: AsyncSession,
+    *,
+    owner_id: int,
+    list_id: int,
+) -> tuple[ShoppingList, Sequence[tuple[ListMember, User]]]:
+    shopping_list, _ = await require_access(session, user_id=owner_id, list_id=list_id, owner_only=True)
+    members_result = await session.execute(
+        select(ListMember, User)
+        .join(User, User.id == ListMember.user_id)
+        .where(ListMember.list_id == list_id)
+        .order_by(ListMember.joined_at.asc(), ListMember.user_id.asc())
+    )
+    members = [(member, member_user) for member, member_user in members_result.all()]
+    return shopping_list, members
 
 
 async def save_list_view_message(
@@ -288,6 +305,53 @@ async def delete_list(
     await session.flush()
 
 
+async def remove_list_member(
+    session: AsyncSession,
+    *,
+    owner_id: int,
+    list_id: int,
+    member_user_id: int,
+) -> ShoppingList:
+    shopping_list, _ = await require_access(session, user_id=owner_id, list_id=list_id, owner_only=True)
+    if shopping_list.owner_id == member_user_id:
+        raise ValidationError("Владельца списка нельзя удалить из участников.")
+
+    membership = await session.get(ListMember, (list_id, member_user_id))
+    if membership is None:
+        raise ListNotFound("Участник не найден.")
+
+    await session.delete(membership)
+    await clear_list_view_message(session, list_id=list_id, user_id=member_user_id)
+    await session.flush()
+    return shopping_list
+
+
+async def ban_list_member(
+    session: AsyncSession,
+    *,
+    owner_id: int,
+    list_id: int,
+    member_user_id: int,
+) -> ShoppingList:
+    shopping_list, _ = await require_access(session, user_id=owner_id, list_id=list_id, owner_only=True)
+    if shopping_list.owner_id == member_user_id:
+        raise ValidationError("Владельца списка нельзя забанить.")
+
+    member_user = await session.get(User, member_user_id)
+    membership = await session.get(ListMember, (list_id, member_user_id))
+    if member_user is None or membership is None:
+        raise ListNotFound("Участник не найден.")
+
+    banned_member = await session.get(ListBannedMember, (list_id, member_user_id))
+    if banned_member is None:
+        session.add(ListBannedMember(list_id=list_id, user_id=member_user_id))
+
+    await session.delete(membership)
+    await clear_list_view_message(session, list_id=list_id, user_id=member_user_id)
+    await session.flush()
+    return shopping_list
+
+
 async def _unique_public_token(session: AsyncSession) -> str:
     for _ in range(10):
         token = generate_public_token()
@@ -360,6 +424,10 @@ async def join_public_list_by_token(
         return None
 
     if shopping_list.owner_id != user_id:
+        banned_member = await session.get(ListBannedMember, (shopping_list.id, user_id))
+        if banned_member is not None:
+            return None
+
         membership = await session.get(ListMember, (shopping_list.id, user_id))
         if membership is None:
             session.add(ListMember(list_id=shopping_list.id, user_id=user_id))
