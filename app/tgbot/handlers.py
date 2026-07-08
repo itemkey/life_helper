@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -25,6 +26,7 @@ from app.tgbot.states import ShoppingListStates
 from app.tgbot.texts import HELP_TEXT, WELCOME_TEXT, format_list_text, format_lists_text, format_settings_text
 
 router = Router(name="shopping")
+logger = logging.getLogger(__name__)
 
 
 async def _ensure_user(session: AsyncSession, event_user: Any) -> int:
@@ -39,26 +41,35 @@ async def _answer_callback(query: CallbackQuery, text: str | None = None, *, sho
         pass
 
 
+def _is_callback_target(target: Any) -> bool:
+    return isinstance(target, CallbackQuery) or (
+        hasattr(target, "answer")
+        and hasattr(target, "data")
+        and hasattr(target, "message")
+    )
+
+
 async def _send_or_edit(
     target: Message | CallbackQuery,
     text: str,
     *,
     reply_markup: Any = None,
     ack: bool = True,
-) -> None:
-    if isinstance(target, CallbackQuery):
+) -> Any | None:
+    if _is_callback_target(target):
         if ack:
             await _answer_callback(target)
         if target.message is None:
-            return
+            return None
         try:
-            await target.message.edit_text(text, reply_markup=reply_markup)
+            result = await target.message.edit_text(text, reply_markup=reply_markup)
+            return result if isinstance(result, Message) else target.message
         except TelegramBadRequest as error:
-            if "message is not modified" not in str(error).lower():
-                await target.message.answer(text, reply_markup=reply_markup)
-        return
+            if "message is not modified" in str(error).lower():
+                return target.message
+            return await target.message.answer(text, reply_markup=reply_markup)
 
-    await target.answer(text, reply_markup=reply_markup)
+    return await target.answer(text, reply_markup=reply_markup)
 
 
 def _parse_id(value: str | None, prefix: str) -> int | None:
@@ -70,25 +81,66 @@ def _parse_id(value: str | None, prefix: str) -> int | None:
         return None
 
 
+def _message_identity(message: Any | None) -> tuple[int, int] | None:
+    if message is None:
+        return None
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return None
+    try:
+        return int(chat_id), int(message_id)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _clear_current_list_view(target: Message | CallbackQuery, session: AsyncSession, user_id: int) -> None:
+    if not _is_callback_target(target):
+        return
+    identity = _message_identity(target.message)
+    if identity is None:
+        return
+    chat_id, message_id = identity
+    await shopping.clear_list_view_message_by_message(
+        session,
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+
+
 async def _show_home(message: Message) -> None:
     await message.answer(WELCOME_TEXT, reply_markup=home_keyboard())
 
 
 async def _show_lists(target: Message | CallbackQuery, session: AsyncSession, user_id: int) -> None:
+    await _clear_current_list_view(target, session, user_id)
     owned, shared = await shopping.list_owned_and_shared(session, user_id=user_id)
     await _send_or_edit(target, format_lists_text(owned, shared), reply_markup=lists_keyboard(owned, shared))
 
 
 async def _show_list(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
     shopping_list, items, level = await shopping.get_list_view(session, user_id=user_id, list_id=list_id)
-    await _send_or_edit(
+    sent_message = await _send_or_edit(
         target,
         format_list_text(shopping_list, items, level),
         reply_markup=list_keyboard(shopping_list, items, level),
     )
+    identity = _message_identity(sent_message)
+    if identity is not None:
+        chat_id, message_id = identity
+        await shopping.save_list_view_message(
+            session,
+            list_id=list_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
 
 
 async def _show_settings(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
+    await _clear_current_list_view(target, session, user_id)
     shopping_list = await shopping.assert_owner(session, owner_id=user_id, list_id=list_id)
     await _send_or_edit(target, format_settings_text(shopping_list), reply_markup=settings_keyboard(shopping_list))
 
@@ -99,10 +151,78 @@ async def _handle_service_error(target: Message | CallbackQuery, error: Exceptio
     else:
         text = "Что-то пошло не так. Попробуй еще раз."
 
-    if isinstance(target, CallbackQuery):
+    if _is_callback_target(target):
         await _answer_callback(target, text, show_alert=True)
     else:
         await target.answer(text)
+
+
+def _is_stale_edit_error(error: TelegramBadRequest) -> bool:
+    text = str(error).lower()
+    stale_markers = (
+        "message to edit not found",
+        "message can't be edited",
+        "message is not found",
+        "chat not found",
+        "message identifier is not specified",
+        "not enough rights",
+    )
+    return any(marker in text for marker in stale_markers)
+
+
+async def _broadcast_public_list_update(
+    bot: Bot,
+    session: AsyncSession,
+    list_id: int,
+    *,
+    exclude_user_id: int | None = None,
+) -> None:
+    update_view = await shopping.get_public_list_update_view(session, list_id=list_id)
+    if update_view is None:
+        return
+
+    shopping_list, items, view_messages = update_view
+    for view_message in view_messages:
+        if view_message.user_id == exclude_user_id:
+            continue
+
+        level = AccessLevel.owner if view_message.user_id == shopping_list.owner_id else AccessLevel.member
+        try:
+            await bot.edit_message_text(
+                text=format_list_text(shopping_list, items, level),
+                chat_id=view_message.chat_id,
+                message_id=view_message.message_id,
+                reply_markup=list_keyboard(shopping_list, items, level),
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" in str(error).lower():
+                continue
+            if _is_stale_edit_error(error):
+                await shopping.clear_list_view_message(
+                    session,
+                    list_id=view_message.list_id,
+                    user_id=view_message.user_id,
+                )
+                continue
+            logger.warning(
+                "Could not edit public list view message for list_id=%s user_id=%s",
+                list_id,
+                view_message.user_id,
+                exc_info=True,
+            )
+        except TelegramForbiddenError:
+            await shopping.clear_list_view_message(
+                session,
+                list_id=view_message.list_id,
+                user_id=view_message.user_id,
+            )
+        except TelegramAPIError:
+            logger.warning(
+                "Could not edit public list view message for list_id=%s user_id=%s",
+                list_id,
+                view_message.user_id,
+                exc_info=True,
+            )
 
 
 @router.message(CommandStart())
@@ -163,7 +283,8 @@ async def callback_lists(query: CallbackQuery, session: AsyncSession) -> None:
 
 @router.callback_query(F.data == "new")
 async def callback_new(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    await _ensure_user(session, query.from_user)
+    user_id = await _ensure_user(session, query.from_user)
+    await _clear_current_list_view(query, session, user_id)
     await state.set_state(ShoppingListStates.creating_title)
     await _send_or_edit(query, "Напиши название нового списка покупок.", reply_markup=cancel_keyboard())
 
@@ -192,6 +313,19 @@ async def callback_open_list(query: CallbackQuery, session: AsyncSession) -> Non
         await _handle_service_error(query, error)
 
 
+@router.callback_query(F.data.startswith("refresh:"))
+async def callback_refresh_list(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "refresh:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_list(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
 @router.callback_query(F.data.startswith("add:"))
 async def callback_add_items(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, query.from_user)
@@ -205,6 +339,8 @@ async def callback_add_items(query: CallbackQuery, state: FSMContext, session: A
         await _handle_service_error(query, error)
         return
 
+    await shopping.clear_list_view_message(session, list_id=list_id, user_id=user_id)
+    await session.commit()
     await state.set_state(ShoppingListStates.adding_items)
     await state.update_data(list_id=list_id)
     await _send_or_edit(
@@ -215,20 +351,22 @@ async def callback_add_items(query: CallbackQuery, state: FSMContext, session: A
 
 
 @router.message(ShoppingListStates.adding_items)
-async def state_add_items(message: Message, state: FSMContext, session: AsyncSession) -> None:
+async def state_add_items(message: Message, state: FSMContext, bot: Bot, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, message.from_user)
     data = await state.get_data()
     list_id = int(data.get("list_id", 0))
     try:
         await shopping.add_items(session, user_id=user_id, list_id=list_id, text=message.text or "")
+        await session.commit()
         await state.clear()
         await _show_list(message, session, user_id, list_id)
+        await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
     except LifeHelperError as error:
         await _handle_service_error(message, error)
 
 
 @router.callback_query(F.data.startswith("toggle:"))
-async def callback_toggle_item(query: CallbackQuery, session: AsyncSession) -> None:
+async def callback_toggle_item(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, query.from_user)
     item_id = _parse_id(query.data, "toggle:")
     if item_id is None:
@@ -236,13 +374,15 @@ async def callback_toggle_item(query: CallbackQuery, session: AsyncSession) -> N
         return
     try:
         list_id = await shopping.toggle_item(session, user_id=user_id, item_id=item_id)
+        await session.commit()
         await _show_list(query, session, user_id, list_id)
+        await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
 
 @router.callback_query(F.data.startswith("delitem:"))
-async def callback_delete_item(query: CallbackQuery, session: AsyncSession) -> None:
+async def callback_delete_item(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, query.from_user)
     item_id = _parse_id(query.data, "delitem:")
     if item_id is None:
@@ -250,7 +390,9 @@ async def callback_delete_item(query: CallbackQuery, session: AsyncSession) -> N
         return
     try:
         list_id = await shopping.delete_item(session, user_id=user_id, item_id=item_id)
+        await session.commit()
         await _show_list(query, session, user_id, list_id)
+        await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 

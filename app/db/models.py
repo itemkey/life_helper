@@ -35,6 +35,10 @@ class User(TimestampMixin, Base):
         back_populates="owner",
         cascade="all, delete-orphan",
     )
+    list_view_messages: Mapped[list[ListViewMessage]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 
 class ShoppingList(TimestampMixin, Base):
@@ -62,6 +66,10 @@ class ShoppingList(TimestampMixin, Base):
         back_populates="shopping_list",
         cascade="all, delete-orphan",
     )
+    view_messages: Mapped[list[ListViewMessage]] = relationship(
+        back_populates="shopping_list",
+        cascade="all, delete-orphan",
+    )
 
 
 class ShoppingItem(TimestampMixin, Base):
@@ -86,6 +94,26 @@ class ShoppingItem(TimestampMixin, Base):
 
     shopping_list: Mapped[ShoppingList] = relationship(back_populates="items")
     author: Mapped[User | None] = relationship()
+
+
+class ListViewMessage(TimestampMixin, Base):
+    __tablename__ = "list_view_messages"
+
+    list_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("shopping_lists.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+
+    shopping_list: Mapped[ShoppingList] = relationship(back_populates="view_messages")
+    user: Mapped[User] = relationship(back_populates="list_view_messages")
 
 
 class ListMember(Base):

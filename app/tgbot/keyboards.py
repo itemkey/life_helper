@@ -69,6 +69,7 @@ def list_keyboard(
             ]
         )
 
+    rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"refresh:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Добавить покупку", callback_data=f"add:{shopping_list.id}")])
     if level == AccessLevel.owner:
         rows.append([InlineKeyboardButton(text="Настройки", callback_data=f"settings:{shopping_list.id}")])

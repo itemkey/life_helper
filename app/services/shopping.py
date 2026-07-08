@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import ListMember, ShoppingItem, ShoppingList, User
+from app.db.models import ListMember, ListViewMessage, ShoppingItem, ShoppingList, User
 from app.services.access import AccessLevel, require_access
 from app.services.errors import AccessDenied, ListNotFound, ValidationError
 from app.services.tokens import generate_public_token, hash_public_token
@@ -87,6 +87,97 @@ async def get_list_view(
     return shopping_list, items.all(), level
 
 
+async def save_list_view_message(
+    session: AsyncSession,
+    *,
+    list_id: int,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+) -> ListViewMessage:
+    view_message = await session.get(ListViewMessage, (list_id, user_id))
+    if view_message is None:
+        view_message = ListViewMessage(
+            list_id=list_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        session.add(view_message)
+    else:
+        view_message.chat_id = chat_id
+        view_message.message_id = message_id
+    await session.flush()
+    return view_message
+
+
+async def clear_list_view_message(
+    session: AsyncSession,
+    *,
+    list_id: int,
+    user_id: int,
+) -> None:
+    await session.execute(
+        delete(ListViewMessage).where(
+            ListViewMessage.list_id == list_id,
+            ListViewMessage.user_id == user_id,
+        )
+    )
+    await session.flush()
+
+
+async def clear_list_view_message_by_message(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+) -> None:
+    await session.execute(
+        delete(ListViewMessage).where(
+            ListViewMessage.user_id == user_id,
+            ListViewMessage.chat_id == chat_id,
+            ListViewMessage.message_id == message_id,
+        )
+    )
+    await session.flush()
+
+
+async def get_public_list_update_view(
+    session: AsyncSession,
+    *,
+    list_id: int,
+) -> tuple[ShoppingList, Sequence[ShoppingItem], Sequence[ListViewMessage]] | None:
+    shopping_list = await session.get(ShoppingList, list_id, populate_existing=True)
+    if shopping_list is None or not shopping_list.is_public:
+        return None
+
+    items = await session.scalars(
+        select(ShoppingItem)
+        .where(ShoppingItem.list_id == list_id)
+        .order_by(ShoppingItem.position.asc(), ShoppingItem.id.asc())
+    )
+    messages = await session.scalars(
+        select(ListViewMessage)
+        .outerjoin(
+            ListMember,
+            and_(
+                ListMember.list_id == ListViewMessage.list_id,
+                ListMember.user_id == ListViewMessage.user_id,
+            ),
+        )
+        .where(
+            ListViewMessage.list_id == list_id,
+            or_(
+                ListViewMessage.user_id == shopping_list.owner_id,
+                ListMember.user_id.is_not(None),
+            ),
+        )
+        .order_by(ListViewMessage.updated_at.asc(), ListViewMessage.user_id.asc())
+    )
+    return shopping_list, items.all(), messages.all()
+
+
 async def add_items(
     session: AsyncSession,
     *,
@@ -96,6 +187,12 @@ async def add_items(
 ) -> list[ShoppingItem]:
     shopping_list, _ = await require_access(session, user_id=user_id, list_id=list_id)
     lines = _normalize_item_lines(text)
+    locked_list = await session.scalar(
+        select(ShoppingList).where(ShoppingList.id == shopping_list.id).with_for_update()
+    )
+    if locked_list is None:
+        raise ListNotFound("Список не найден.")
+    shopping_list = locked_list
     max_position = await session.scalar(
         select(func.coalesce(func.max(ShoppingItem.position), 0)).where(ShoppingItem.list_id == shopping_list.id)
     )
@@ -212,6 +309,12 @@ async def disable_public_access(
     shopping_list.public_token = None
     shopping_list.public_token_hash = None
     await session.execute(delete(ListMember).where(ListMember.list_id == list_id))
+    await session.execute(
+        delete(ListViewMessage).where(
+            ListViewMessage.list_id == list_id,
+            ListViewMessage.user_id != owner_id,
+        )
+    )
     await session.flush()
     return shopping_list
 
