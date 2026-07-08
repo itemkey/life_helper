@@ -54,6 +54,21 @@ async def test_added_items_get_sequential_positions(session):
     assert [item.position for item in first_items + next_items] == [1, 2, 3, 4]
 
 
+async def test_set_all_items_done_updates_every_item(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    items = await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Молоко\nХлеб")
+    await shopping.toggle_item(session, user_id=100, item_id=items[0].id)
+
+    await shopping.set_all_items_done(session, user_id=100, list_id=shopping_list.id, is_done=True)
+    _, view_items, _ = await shopping.get_list_view(session, user_id=100, list_id=shopping_list.id)
+    assert [item.is_done for item in view_items] == [True, True]
+
+    await shopping.set_all_items_done(session, user_id=100, list_id=shopping_list.id, is_done=False)
+    _, view_items, _ = await shopping.get_list_view(session, user_id=100, list_id=shopping_list.id)
+    assert [item.is_done for item in view_items] == [False, False]
+
+
 async def test_private_list_is_not_accessible_to_other_user(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     await shopping.upsert_user(session, FakeTelegramUser(id=200))

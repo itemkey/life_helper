@@ -23,6 +23,20 @@ def test_list_keyboard_has_members_button():
     assert any(button.text == "Участники списка" and button.callback_data == "members:1" for button in buttons)
 
 
+def test_list_keyboard_has_bulk_check_buttons_below_add_button():
+    shopping_list = ShoppingList(id=1, owner_id=100, title="Дом")
+
+    keyboard = list_keyboard(shopping_list, [], AccessLevel.member)
+    row_texts = [[button.text for button in row] for row in keyboard.inline_keyboard]
+    row_callbacks = [[button.callback_data for button in row] for row in keyboard.inline_keyboard]
+    add_row_index = row_texts.index(["Добавить покупку"])
+
+    assert row_texts[add_row_index + 1] == ["Поставить все галочки"]
+    assert row_callbacks[add_row_index + 1] == ["checkall:1"]
+    assert row_texts[add_row_index + 2] == ["Убрать все галочки"]
+    assert row_callbacks[add_row_index + 2] == ["uncheckall:1"]
+
+
 def test_owner_members_keyboard_has_manage_button():
     shopping_list = ShoppingList(id=1, owner_id=100, title="Дом")
 

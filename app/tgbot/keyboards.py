@@ -82,6 +82,8 @@ def list_keyboard(
 
     rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"refresh:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Добавить покупку", callback_data=f"add:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Поставить все галочки", callback_data=f"checkall:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Убрать все галочки", callback_data=f"uncheckall:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Участники списка", callback_data=f"members:{shopping_list.id}")])
     if level == AccessLevel.owner:
         rows.append([InlineKeyboardButton(text="Настройки", callback_data=f"settings:{shopping_list.id}")])

@@ -507,6 +507,55 @@ async def callback_toggle_item(query: CallbackQuery, bot: Bot, session: AsyncSes
         await _handle_service_error(query, error)
 
 
+async def _callback_set_all_items_done(
+    query: CallbackQuery,
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    prefix: str,
+    is_done: bool,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, prefix)
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        updated_list_id = await shopping.set_all_items_done(
+            session,
+            user_id=user_id,
+            list_id=list_id,
+            is_done=is_done,
+        )
+        await session.commit()
+        await _show_list(query, session, user_id, updated_list_id)
+        await _broadcast_public_list_update(bot, session, updated_list_id, exclude_user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("checkall:"))
+async def callback_check_all_items(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+    await _callback_set_all_items_done(
+        query,
+        bot,
+        session,
+        prefix="checkall:",
+        is_done=True,
+    )
+
+
+@router.callback_query(F.data.startswith("uncheckall:"))
+async def callback_uncheck_all_items(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+    await _callback_set_all_items_done(
+        query,
+        bot,
+        session,
+        prefix="uncheckall:",
+        is_done=False,
+    )
+
+
 @router.callback_query(F.data.startswith("delitem:"))
 async def callback_delete_item(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, query.from_user)

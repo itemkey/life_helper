@@ -8,12 +8,14 @@ from app.db.models import ListViewMessage
 from app.services import shopping
 from app.tgbot.handlers import (
     callback_delete_item,
+    callback_check_all_items,
     callback_members,
     callback_members_manage,
     callback_member_ban,
     callback_member_remove,
     callback_refresh_list,
     callback_toggle_item,
+    callback_uncheck_all_items,
     cmd_start,
     state_add_items,
 )
@@ -303,6 +305,41 @@ async def test_toggle_and_delete_broadcast_public_list_updates_to_other_viewers(
 
     assert len(bot.edits) == 1
     assert "Список пуст" in str(bot.edits[0]["text"])
+
+
+async def test_bulk_check_buttons_update_items_and_broadcast(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Молоко\nХлеб")
+    await shopping.save_list_view_message(session, list_id=shopping_list.id, user_id=100, chat_id=1000, message_id=10)
+    bot = FakeBot()
+    query = FakeCallback(
+        from_user=FakeTelegramUser(id=200),
+        data=f"checkall:{shopping_list.id}",
+        message=FakeEditableMessage(chat=FakeChat(2000), message_id=20),
+    )
+
+    await callback_check_all_items(query, bot, session)
+
+    assert query.message is not None
+    assert "✓ Молоко" in query.message.edits[-1][0]
+    assert "✓ Хлеб" in query.message.edits[-1][0]
+    assert len(bot.edits) == 1
+    assert "✓ Молоко" in str(bot.edits[0]["text"])
+    assert "✓ Хлеб" in str(bot.edits[0]["text"])
+
+    bot.edits.clear()
+    query.data = f"uncheckall:{shopping_list.id}"
+    await callback_uncheck_all_items(query, bot, session)
+
+    assert "□ Молоко" in query.message.edits[-1][0]
+    assert "□ Хлеб" in query.message.edits[-1][0]
+    assert len(bot.edits) == 1
+    assert "□ Молоко" in str(bot.edits[0]["text"])
+    assert "□ Хлеб" in str(bot.edits[0]["text"])
 
 
 async def test_private_list_add_does_not_broadcast(session):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import ListBannedMember, ListMember, ListViewMessage, ShoppingItem, ShoppingList, User
@@ -263,6 +263,23 @@ async def toggle_item(
     item.is_done = not item.is_done
     await session.flush()
     return item.list_id
+
+
+async def set_all_items_done(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    list_id: int,
+    is_done: bool,
+) -> int:
+    shopping_list, _ = await require_access(session, user_id=user_id, list_id=list_id)
+    await session.execute(
+        update(ShoppingItem)
+        .where(ShoppingItem.list_id == shopping_list.id)
+        .values(is_done=is_done)
+    )
+    await session.flush()
+    return shopping_list.id
 
 
 async def delete_item(
