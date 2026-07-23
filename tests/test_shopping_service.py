@@ -3,7 +3,17 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from app.db.models import Contribution, Expense, ExpenseShare, ListBannedMember, ListViewMessage, ShoppingItem
+from app.db.models import (
+    Contribution,
+    Expense,
+    ExpenseCategory,
+    ExpenseItem,
+    ExpenseShare,
+    ListBannedMember,
+    ListViewMessage,
+    ShoppingCategory,
+    ShoppingItem,
+)
 from app.services import shopping
 from app.services.access import AccessLevel
 from app.services.errors import AccessDenied, ValidationError
@@ -226,6 +236,121 @@ async def test_personal_items_are_visible_but_only_owner_or_personal_owner_can_d
     assert owner_view_items == []
 
 
+async def test_shopping_categories_are_created_for_owner_and_joined_members(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="member"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=shopping_list.id)
+    assert [(category.title, category.scope, category.owner_id, category.accounting_mode) for category in categories] == [
+        ("Общее", shopping.ITEM_SCOPE_COMMON, None, shopping.SHOPPING_CATEGORY_MODE_PER_ITEM),
+        ("Личное", shopping.ITEM_SCOPE_PERSONAL, 100, shopping.SHOPPING_CATEGORY_MODE_PER_ITEM),
+    ]
+
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=200, list_id=shopping_list.id)
+    assert any(category.scope == shopping.ITEM_SCOPE_PERSONAL and category.owner_id == 200 for category in categories)
+
+
+async def test_items_can_be_added_to_categories_with_personal_permissions(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    await shopping.upsert_user(session, FakeTelegramUser(id=300))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    await shopping.join_public_list_by_token(session, user_id=300, token=token)
+
+    category = await shopping.create_shopping_category(
+        session,
+        user_id=200,
+        list_id=shopping_list.id,
+        title="Энергетики",
+        scope=shopping.ITEM_SCOPE_PERSONAL,
+    )
+    item = (
+        await shopping.add_items(
+            session,
+            user_id=200,
+            list_id=shopping_list.id,
+            text="Red Bull",
+            category_id=category.id,
+        )
+    )[0]
+    assert (item.scope, item.personal_owner_id, item.category_id) == (
+        shopping.ITEM_SCOPE_PERSONAL,
+        200,
+        category.id,
+    )
+
+    with pytest.raises(AccessDenied):
+        await shopping.add_items(
+            session,
+            user_id=300,
+            list_id=shopping_list.id,
+            text="Monster",
+            category_id=category.id,
+        )
+
+
+async def test_receipt_purchase_links_multiple_items_and_can_be_cancelled(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=shopping_list.id)
+    common_category = next(category for category in categories if category.scope == shopping.ITEM_SCOPE_COMMON)
+    await shopping.set_shopping_category_accounting_mode(
+        session,
+        user_id=100,
+        category_id=common_category.id,
+        accounting_mode=shopping.SHOPPING_CATEGORY_MODE_RECEIPT,
+    )
+    items = await shopping.add_items(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        text="Сок\nЧипсы",
+        category_id=common_category.id,
+    )
+
+    list_id = await shopping.record_receipt_purchase(
+        session,
+        user_id=100,
+        category_id=common_category.id,
+        item_ids=[item.id for item in items],
+        amount="10.01",
+        source=shopping.EXPENSE_SOURCE_PERSONAL,
+    )
+
+    assert list_id == shopping_list.id
+    assert all(item.is_done for item in items)
+    assert [(link.expense_id, link.item_id) for link in (await session.scalars(select(ExpenseItem))).all()] == [
+        (1, items[0].id),
+        (1, items[1].id),
+    ]
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert [(expense.title, expense.amount, expense.item_id) for expense in summary.expenses] == [
+        ("Чек: Общее", 1001, None)
+    ]
+    assert [
+        (share.user_id, share.amount)
+        for expense in summary.expenses
+        for share in expense.shares
+    ] == [(100, 501), (200, 500)]
+
+    with pytest.raises(ValidationError):
+        await shopping.unmark_item(session, user_id=100, item_id=items[0].id)
+
+    await shopping.cancel_receipt_expense(session, user_id=100, expense_id=summary.expenses[0].id)
+    assert (await session.scalars(select(Expense))).all() == []
+    assert (await session.scalars(select(ExpenseItem))).all() == []
+    assert [item.is_done for item in items] == [False, False]
+
+
 async def test_item_purchase_creates_default_common_and_personal_expense_shares(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     await shopping.upsert_user(session, FakeTelegramUser(id=200))
@@ -302,6 +427,72 @@ async def test_money_summary_tracks_contributions_sources_and_settlements(sessio
     ]
 
 
+async def test_expense_categories_can_be_created_and_assigned_to_expenses(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+
+    category = await shopping.create_expense_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="  Маршрутка  ",
+    )
+    assert category.title == "Маршрутка"
+    assert category.default_split == shopping.EXPENSE_SPLIT_SELECTED
+
+    with pytest.raises(ValidationError):
+        await shopping.create_expense_category(
+            session,
+            user_id=100,
+            list_id=shopping_list.id,
+            title="маршрутка",
+        )
+
+    await shopping.create_expense(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Маршрутка",
+        amount="3",
+        source=shopping.EXPENSE_SOURCE_PERSONAL,
+        share_user_ids=[100],
+        category_id=category.id,
+    )
+
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert [(item.title, item.position) for item in summary.categories] == [("Маршрутка", 1)]
+    assert [(expense.title, expense.category_id, expense.category.title) for expense in summary.expenses] == [
+        ("Маршрутка", category.id, "Маршрутка")
+    ]
+
+
+async def test_expense_category_default_split_can_be_changed(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    category = await shopping.create_expense_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Автобус",
+    )
+
+    await shopping.set_expense_category_default_split(
+        session,
+        user_id=100,
+        category_id=category.id,
+        default_split=shopping.EXPENSE_SPLIT_ALL,
+    )
+
+    assert category.default_split == shopping.EXPENSE_SPLIT_ALL
+    with pytest.raises(ValidationError):
+        await shopping.set_expense_category_default_split(
+            session,
+            user_id=100,
+            category_id=category.id,
+            default_split="half",
+        )
+
+
 async def test_removed_member_cleanup_removes_personal_items_and_member_money(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     await shopping.upsert_user(session, FakeTelegramUser(id=200))
@@ -331,4 +522,5 @@ async def test_removed_member_cleanup_removes_personal_items_and_member_money(se
     assert (await session.scalars(select(ShoppingItem))).all() == []
     assert (await session.scalars(select(Contribution))).all() == []
     assert (await session.scalars(select(Expense))).all() == []
+    assert (await session.scalars(select(ExpenseCategory))).all() == []
     assert (await session.scalars(select(ExpenseShare))).all() == []

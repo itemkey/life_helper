@@ -3,14 +3,21 @@ from __future__ import annotations
 from collections.abc import Sequence
 from html import escape
 
-from app.db.models import ListMember, ShoppingItem, ShoppingList, User
+from app.db.models import ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
 from app.services.access import AccessLevel
-from app.services.shopping import EXPENSE_SOURCE_CASHBOX, MoneySummary, format_money_amount
+from app.services.shopping import (
+    EXPENSE_SOURCE_CASHBOX,
+    EXPENSE_SPLIT_ALL,
+    EXPENSE_SPLIT_ME,
+    EXPENSE_SPLIT_SELECTED,
+    MoneySummary,
+    format_money_amount,
+)
 
 
 WELCOME_TEXT = (
     "Привет. Я Life Helper.\n\n"
-    "Теперь можно вести тусовки: общий список, личные хотелки, взносы, траты, такси и честный итог по деньгам."
+    "Теперь можно вести тусовки: общий список, личные хотелки, категории покупок, чеки, взносы, траты и честный итог по деньгам."
 )
 
 HELP_TEXT = (
@@ -18,7 +25,7 @@ HELP_TEXT = (
     "/lists - открыть мои тусовки\n"
     "/new - создать тусовку\n"
     "/cancel - отменить текущий ввод\n\n"
-    "Ссылка дает доступ только к конкретной тусовке. Участник может добавлять покупки в общее и в свой личный список. "
+    "Ссылка дает доступ только к конкретной тусовке. Участник может добавлять покупки в общее и в свои личные категории. "
     "Деньги считаются по взносам, тратам из кассы и оплатам из своих."
 )
 
@@ -41,6 +48,7 @@ def format_list_text(
     shopping_list: ShoppingList,
     items: Sequence[ShoppingItem],
     level: AccessLevel,
+    categories: Sequence[ShoppingCategory] = (),
 ) -> str:
     role = "владелец" if level == AccessLevel.owner else "участник"
     visibility = "публичный" if shopping_list.is_public else "приватный"
@@ -50,33 +58,53 @@ def format_list_text(
         "",
     ]
     if not items:
-        lines.append("Тусовка пока пустая. Добавь продукты в общее или хотелки в личный список.")
+        lines.append("Тусовка пока пустая. Добавь продукты в категорию покупок.")
         return "\n".join(lines)
 
-    common_items = [item for item in items if item.scope != "personal"]
-    personal_items = [item for item in items if item.scope == "personal"]
+    categorized_items: dict[int, list[ShoppingItem]] = {}
+    uncategorized_items: list[ShoppingItem] = []
+    for item in items:
+        if item.category_id is None:
+            uncategorized_items.append(item)
+        else:
+            categorized_items.setdefault(item.category_id, []).append(item)
 
-    if common_items:
-        lines.append("<b>Общее</b>")
-        lines.extend(_format_item_lines(common_items))
-    else:
-        lines.append("<b>Общее</b>")
-        lines.append("Пока пусто.")
+    shown_category_ids: set[int] = set()
+    ordered_categories = sorted(categories, key=lambda category: (category.scope != "common", category.position, category.id))
+    for category in ordered_categories:
+        category_items = categorized_items.get(category.id, [])
+        if not category_items:
+            continue
+        if shown_category_ids:
+            lines.append("")
+        lines.append(f"<b>{_format_shopping_category_heading(category)}</b>")
+        lines.extend(_format_item_lines(category_items))
+        shown_category_ids.add(category.id)
 
-    personal_groups: dict[int, tuple[str, list[ShoppingItem]]] = {}
-    for item in personal_items:
-        owner = item.personal_owner
-        owner_id = item.personal_owner_id or 0
-        owner_label = _format_user_name(owner) if owner is not None else f"ID {owner_id}"
-        if owner_id not in personal_groups:
-            personal_groups[owner_id] = (owner_label, [])
-        personal_groups[owner_id][1].append(item)
+    leftover_category_ids = [category_id for category_id in categorized_items if category_id not in shown_category_ids]
+    for category_id in leftover_category_ids:
+        if shown_category_ids:
+            lines.append("")
+        category_items = categorized_items[category_id]
+        category = category_items[0].category
+        lines.append(f"<b>{_format_shopping_category_heading(category) if category is not None else 'Покупки'}</b>")
+        lines.extend(_format_item_lines(category_items))
+        shown_category_ids.add(category_id)
 
-    for _, (owner_label, owner_items) in sorted(personal_groups.items(), key=lambda group: group[1][0]):
-        lines.append("")
-        lines.append(f"<b>Личное: {owner_label}</b>")
-        lines.extend(_format_item_lines(owner_items))
+    if uncategorized_items:
+        if shown_category_ids:
+            lines.append("")
+        lines.append("<b>Без категории</b>")
+        lines.extend(_format_item_lines(uncategorized_items))
     return "\n".join(lines)
+
+
+def _format_shopping_category_heading(category: ShoppingCategory) -> str:
+    mode = "по чеку" if category.accounting_mode == "receipt" else "по товару"
+    if category.scope == "personal":
+        owner = _format_user_name(category.owner) if category.owner is not None else f"ID {category.owner_id}"
+        return f"{escape(category.title)}: {owner} ({mode})"
+    return f"{escape(category.title)} ({mode})"
 
 
 def _format_item_lines(items: Sequence[ShoppingItem]) -> list[str]:
@@ -147,8 +175,20 @@ def format_settings_text(shopping_list: ShoppingList) -> str:
     )
 
 
-def _format_expense_source(source: str) -> str:
-    return "касса" if source == EXPENSE_SOURCE_CASHBOX else "из своих"
+def _format_expense_title_with_category(expense: object) -> str:
+    category = getattr(expense, "category", None)
+    title = escape(getattr(expense, "title"))
+    if category is None:
+        return title
+    return f"{escape(category.title)}: {title}"
+
+
+def _format_expense_meta(expense: object) -> str:
+    split_count = len(getattr(expense, "shares"))
+    source = getattr(expense, "source")
+    if source == EXPENSE_SOURCE_CASHBOX:
+        return f"касса, долей: {split_count}"
+    return f"из своих, платил {_format_user_name(getattr(expense, 'payer'))}, долей: {split_count}"
 
 
 def _format_balance_action(balance: int, currency: str) -> str:
@@ -180,11 +220,9 @@ def format_money_text(summary: MoneySummary) -> str:
     lines.append("<b>Траты</b>")
     if summary.expenses:
         for expense in summary.expenses:
-            split_count = len(expense.shares)
             lines.append(
-                f"- {escape(expense.title)}: {format_money_amount(expense.amount, currency)} "
-                f"({_format_expense_source(expense.source)}, платил {_format_user_name(expense.payer)}, "
-                f"долей: {split_count})"
+                f"- {_format_expense_title_with_category(expense)}: {format_money_amount(expense.amount, currency)} "
+                f"({_format_expense_meta(expense)})"
             )
     else:
         lines.append("Трат пока нет.")
@@ -195,6 +233,109 @@ def format_money_text(summary: MoneySummary) -> str:
         lines.append(
             f"- {_format_user_name(balance.user)}: {_format_balance_action(balance.balance, currency)}"
         )
+    return "\n".join(lines)
+
+
+def format_categories_text(
+    shopping_list: ShoppingList,
+    categories: Sequence[ExpenseCategory],
+) -> str:
+    lines = [
+        f"<b>Категории трат: {escape(shopping_list.title)}</b>",
+        "",
+    ]
+    if categories:
+        lines.append("Выбери категорию для новой траты или добавь свою.")
+        lines.append("")
+        for index, category in enumerate(categories, start=1):
+            lines.append(f"{index}. {escape(category.title)} — {_format_expense_split_label(category.default_split)}")
+    else:
+        lines.append("Категорий пока нет. Добавь любую: такси, маршрутка, автобус, доставка, билеты.")
+    return "\n".join(lines)
+
+
+def _format_expense_split_label(default_split: str) -> str:
+    if default_split == EXPENSE_SPLIT_ALL:
+        return "на всех"
+    if default_split == EXPENSE_SPLIT_ME:
+        return "только на меня"
+    if default_split == EXPENSE_SPLIT_SELECTED:
+        return "выбирать участников"
+    return "выбирать участников"
+
+
+def format_expense_category_text(
+    shopping_list: ShoppingList,
+    category: ExpenseCategory,
+) -> str:
+    return "\n".join(
+        [
+            f"<b>Категория трат: {escape(category.title)}</b>",
+            f"Тусовка: {escape(shopping_list.title)}",
+            f"Распределение: {_format_expense_split_label(category.default_split)}",
+        ]
+    )
+
+
+def format_expense_category_split_text(category: ExpenseCategory) -> str:
+    return "\n".join(
+        [
+            f"<b>Распределение: {escape(category.title)}</b>",
+            f"Сейчас: {_format_expense_split_label(category.default_split)}",
+            "",
+            "Выбери, как обычно делить траты этой категории.",
+        ]
+    )
+
+
+def format_shopping_categories_text(
+    shopping_list: ShoppingList,
+    categories: Sequence[ShoppingCategory],
+) -> str:
+    lines = [
+        f"<b>Категории покупок: {escape(shopping_list.title)}</b>",
+        "",
+    ]
+    if not categories:
+        lines.append("Категорий покупок пока нет.")
+        return "\n".join(lines)
+
+    for index, category in enumerate(categories, start=1):
+        lines.append(f"{index}. {_format_shopping_category_heading(category)}")
+    return "\n".join(lines)
+
+
+def format_shopping_category_text(
+    category: ShoppingCategory,
+    items: Sequence[ShoppingItem],
+) -> str:
+    lines = [
+        f"<b>{_format_shopping_category_heading(category)}</b>",
+        "",
+    ]
+    if items:
+        lines.extend(_format_item_lines(items))
+    else:
+        lines.append("В этой категории пока пусто.")
+    return "\n".join(lines)
+
+
+def format_receipt_items_text(
+    category: ShoppingCategory,
+    items: Sequence[ShoppingItem],
+    selected_item_ids: Sequence[int],
+) -> str:
+    selected = set(selected_item_ids)
+    lines = [
+        f"<b>Чек: {_format_shopping_category_heading(category)}</b>",
+        "",
+    ]
+    if not items:
+        lines.append("В этой категории нет некупленных товаров для чека.")
+        return "\n".join(lines)
+    for index, item in enumerate(items, start=1):
+        mark = "✓" if item.id in selected else "□"
+        lines.append(f"{index}. {mark} {escape(item.text)}")
     return "\n".join(lines)
 
 

@@ -75,6 +75,11 @@ class ShoppingList(TimestampMixin, Base):
         cascade="all, delete-orphan",
         order_by="ShoppingItem.position",
     )
+    shopping_categories: Mapped[list[ShoppingCategory]] = relationship(
+        back_populates="shopping_list",
+        cascade="all, delete-orphan",
+        order_by="ShoppingCategory.position",
+    )
     members: Mapped[list[ListMember]] = relationship(
         back_populates="shopping_list",
         cascade="all, delete-orphan",
@@ -94,6 +99,11 @@ class ShoppingList(TimestampMixin, Base):
     expenses: Mapped[list[Expense]] = relationship(
         back_populates="shopping_list",
         cascade="all, delete-orphan",
+    )
+    expense_categories: Mapped[list[ExpenseCategory]] = relationship(
+        back_populates="shopping_list",
+        cascade="all, delete-orphan",
+        order_by="ExpenseCategory.position",
     )
 
 
@@ -131,11 +141,69 @@ class ShoppingItem(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    category_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("shopping_categories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     shopping_list: Mapped[ShoppingList] = relationship(back_populates="items")
     author: Mapped[User | None] = relationship(foreign_keys=[author_id])
     personal_owner: Mapped[User | None] = relationship(foreign_keys=[personal_owner_id])
+    category: Mapped[ShoppingCategory | None] = relationship(back_populates="items")
     expenses: Mapped[list[Expense]] = relationship(back_populates="item")
+    expense_links: Mapped[list[ExpenseItem]] = relationship(
+        back_populates="item",
+        cascade="all, delete-orphan",
+    )
+
+
+class ShoppingCategory(TimestampMixin, Base):
+    __tablename__ = "shopping_categories"
+    __table_args__ = (
+        CheckConstraint("scope in ('common', 'personal')", name="ck_shopping_categories_scope"),
+        CheckConstraint("accounting_mode in ('per_item', 'receipt')", name="ck_shopping_categories_accounting_mode"),
+        CheckConstraint(
+            "(scope = 'common' and owner_id is null) or "
+            "(scope = 'personal' and owner_id is not null)",
+            name="ck_shopping_categories_scope_owner",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    list_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("shopping_lists.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(80), nullable=False)
+    scope: Mapped[str] = mapped_column(String(16), nullable=False, default="common", server_default="common")
+    owner_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    accounting_mode: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="per_item",
+        server_default="per_item",
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_by_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    shopping_list: Mapped[ShoppingList] = relationship(back_populates="shopping_categories")
+    owner: Mapped[User | None] = relationship(foreign_keys=[owner_id])
+    created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
+    items: Mapped[list[ShoppingItem]] = relationship(back_populates="category", order_by="ShoppingItem.position")
 
 
 class ListViewMessage(TimestampMixin, Base):
@@ -264,6 +332,12 @@ class Expense(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    category_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("expense_categories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_by_id: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -274,12 +348,47 @@ class Expense(TimestampMixin, Base):
     shopping_list: Mapped[ShoppingList] = relationship(back_populates="expenses")
     payer: Mapped[User] = relationship(foreign_keys=[payer_id])
     item: Mapped[ShoppingItem | None] = relationship(back_populates="expenses")
+    category: Mapped[ExpenseCategory | None] = relationship(back_populates="expenses")
     created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
     shares: Mapped[list[ExpenseShare]] = relationship(
         back_populates="expense",
         cascade="all, delete-orphan",
         order_by="ExpenseShare.user_id",
     )
+    item_links: Mapped[list[ExpenseItem]] = relationship(
+        back_populates="expense",
+        cascade="all, delete-orphan",
+        order_by="ExpenseItem.item_id",
+    )
+
+
+class ExpenseCategory(TimestampMixin, Base):
+    __tablename__ = "expense_categories"
+    __table_args__ = (
+        CheckConstraint("default_split in ('all', 'selected', 'me')", name="ck_expense_categories_default_split"),
+        UniqueConstraint("list_id", "title", name="uq_expense_categories_list_id_title"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    list_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("shopping_lists.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(80), nullable=False)
+    default_split: Mapped[str] = mapped_column(String(16), nullable=False, default="selected", server_default="selected")
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_by_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    shopping_list: Mapped[ShoppingList] = relationship(back_populates="expense_categories")
+    created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
+    expenses: Mapped[list[Expense]] = relationship(back_populates="category")
 
 
 class ExpenseShare(Base):
@@ -299,3 +408,21 @@ class ExpenseShare(Base):
 
     expense: Mapped[Expense] = relationship(back_populates="shares")
     user: Mapped[User] = relationship()
+
+
+class ExpenseItem(Base):
+    __tablename__ = "expense_items"
+
+    expense_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("expenses.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("shopping_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    expense: Mapped[Expense] = relationship(back_populates="item_links")
+    item: Mapped[ShoppingItem] = relationship(back_populates="expense_links")

@@ -1,4 +1,4 @@
 from app.db.base import Base
-from app.db.models import ListMember, ShoppingItem, ShoppingList, User
+from app.db.models import ExpenseItem, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
 
-__all__ = ["Base", "ListMember", "ShoppingItem", "ShoppingList", "User"]
+__all__ = ["Base", "ExpenseItem", "ListMember", "ShoppingCategory", "ShoppingItem", "ShoppingList", "User"]
