@@ -143,6 +143,7 @@ def shopping_category_keyboard(
         next_label = "Считать по чеку" if next_mode == "receipt" else "Считать по товарам"
         rows.append([InlineKeyboardButton(text=next_label, callback_data=f"shopping_category_mode:{category.id}:{next_mode}")])
         rows.append([InlineKeyboardButton(text="Переименовать", callback_data=f"shopping_category_rename:{category.id}")])
+        rows.append([InlineKeyboardButton(text="Удалить", callback_data=f"shopping_category_delete:{category.id}")])
     rows.append([InlineKeyboardButton(text="Назад к категориям", callback_data=f"shopping_categories:{category.list_id}")])
     rows.append([InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{category.list_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

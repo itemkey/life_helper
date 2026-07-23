@@ -295,6 +295,54 @@ async def test_items_can_be_added_to_categories_with_personal_permissions(sessio
         )
 
 
+async def test_empty_custom_shopping_category_can_be_deleted(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    category = await shopping.create_shopping_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Напитки",
+        scope=shopping.ITEM_SCOPE_COMMON,
+    )
+
+    list_id = await shopping.delete_shopping_category(session, user_id=100, category_id=category.id)
+
+    assert list_id == shopping_list.id
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=shopping_list.id)
+    assert all(item.id != category.id for item in categories)
+
+
+async def test_shopping_category_delete_rejects_non_empty_category(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    category = await shopping.create_shopping_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Напитки",
+        scope=shopping.ITEM_SCOPE_COMMON,
+    )
+    await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Сок", category_id=category.id)
+
+    with pytest.raises(ValidationError, match="Сначала удали товары"):
+        await shopping.delete_shopping_category(session, user_id=100, category_id=category.id)
+
+
+async def test_shopping_category_delete_rejects_last_required_categories(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=shopping_list.id)
+    common_category = next(category for category in categories if category.scope == shopping.ITEM_SCOPE_COMMON)
+    personal_category = next(category for category in categories if category.scope == shopping.ITEM_SCOPE_PERSONAL)
+
+    with pytest.raises(ValidationError, match="последнюю общую"):
+        await shopping.delete_shopping_category(session, user_id=100, category_id=common_category.id)
+
+    with pytest.raises(ValidationError, match="единственную личную"):
+        await shopping.delete_shopping_category(session, user_id=100, category_id=personal_category.id)
+
+
 async def test_receipt_purchase_links_multiple_items_and_can_be_cancelled(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     await shopping.upsert_user(session, FakeTelegramUser(id=200))

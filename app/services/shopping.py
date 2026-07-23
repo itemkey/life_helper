@@ -621,6 +621,51 @@ async def set_shopping_category_accounting_mode(
     return category
 
 
+async def delete_shopping_category(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    category_id: int,
+) -> int:
+    shopping_list, category, level = await get_shopping_category(session, user_id=user_id, category_id=category_id)
+    _ensure_shopping_category_edit_allowed(category=category, user_id=user_id, level=level)
+
+    item_count = await session.scalar(
+        select(func.count()).select_from(ShoppingItem).where(ShoppingItem.category_id == category.id)
+    )
+    if int(item_count or 0) > 0:
+        raise ValidationError("Сначала удали товары из этой категории покупок.")
+
+    if category.scope == ITEM_SCOPE_COMMON:
+        category_count = await session.scalar(
+            select(func.count())
+            .select_from(ShoppingCategory)
+            .where(
+                ShoppingCategory.list_id == shopping_list.id,
+                ShoppingCategory.scope == ITEM_SCOPE_COMMON,
+            )
+        )
+        if int(category_count or 0) <= 1:
+            raise ValidationError("Нельзя удалить последнюю общую категорию покупок.")
+    else:
+        category_count = await session.scalar(
+            select(func.count())
+            .select_from(ShoppingCategory)
+            .where(
+                ShoppingCategory.list_id == shopping_list.id,
+                ShoppingCategory.scope == ITEM_SCOPE_PERSONAL,
+                ShoppingCategory.owner_id == category.owner_id,
+            )
+        )
+        if int(category_count or 0) <= 1:
+            raise ValidationError("Нельзя удалить единственную личную категорию участника.")
+
+    list_id = shopping_list.id
+    await session.delete(category)
+    await session.flush()
+    return list_id
+
+
 async def _participant_user_ids(session: AsyncSession, shopping_list: ShoppingList) -> list[int]:
     return [user.id for user in await _get_participant_users(session, shopping_list)]
 

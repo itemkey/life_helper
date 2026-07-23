@@ -33,6 +33,7 @@ from app.tgbot.handlers import (
     callback_receipt_select,
     callback_refresh_list,
     callback_shopping_category_add_common,
+    callback_shopping_category_delete,
     callback_shopping_category_mode,
     callback_toggle_item,
     callback_uncheck_all_items,
@@ -528,6 +529,32 @@ async def test_shopping_category_add_and_receipt_mode_flow(session):
     )
     await session.refresh(category)
     assert category.accounting_mode == shopping.SHOPPING_CATEGORY_MODE_RECEIPT
+
+
+async def test_shopping_category_delete_handler_removes_empty_category(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    category = await shopping.create_shopping_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Напитки",
+        scope=shopping.ITEM_SCOPE_COMMON,
+    )
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_shopping_category_delete(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"shopping_category_delete:{category.id}",
+            message=query_message,
+        ),
+        session,
+    )
+
+    assert query_message.edits
+    assert "Напитки" not in query_message.edits[-1][0]
+    assert await session.get(type(category), category.id) is None
 
 
 async def test_receipt_handler_flow_records_one_expense_for_selected_items(session):

@@ -132,6 +132,7 @@ def test_receipt_category_keyboard_has_receipt_and_mode_actions():
 
     assert any(button.text == "Чек" and button.callback_data == "receipt:10" for button in buttons)
     assert any(button.text == "Считать по товарам" and button.callback_data == "shopping_category_mode:10:per_item" for button in buttons)
+    assert any(button.text == "Удалить" and button.callback_data == "shopping_category_delete:10" for button in buttons)
 
 
 def test_receipt_items_and_default_split_keyboards():

@@ -640,6 +640,20 @@ async def callback_shopping_category_mode(query: CallbackQuery, session: AsyncSe
         await _handle_service_error(query, error)
 
 
+@router.callback_query(F.data.startswith("shopping_category_delete:"))
+async def callback_shopping_category_delete(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    category_id = _parse_id(query.data, "shopping_category_delete:")
+    if category_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id = await shopping.delete_shopping_category(session, user_id=user_id, category_id=category_id)
+        await _show_shopping_categories(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
 async def _start_shopping_category_title(
     query: CallbackQuery,
     state: FSMContext,
