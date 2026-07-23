@@ -42,6 +42,7 @@ async def main() -> None:
     dispatcher.include_router(router)
     allowed_updates = dispatcher.resolve_used_update_types()
 
+    bot_info = await bot.get_me()
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Главное меню"),
@@ -54,8 +55,10 @@ async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=settings.drop_pending_updates)
 
     logger.info(
-        "Starting life-helper bot version=%s mode=polling drop_pending_updates=%s allowed_updates=%s",
+        "Starting life-helper bot version=%s bot_id=%s bot_username=@%s mode=polling drop_pending_updates=%s allowed_updates=%s",
         _app_version(),
+        bot_info.id,
+        bot_info.username,
         settings.drop_pending_updates,
         ",".join(allowed_updates),
     )

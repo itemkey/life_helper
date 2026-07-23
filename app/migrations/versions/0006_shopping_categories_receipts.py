@@ -1,6 +1,6 @@
 """add shopping categories and receipt expense links
 
-Revision ID: 0006_shopping_categories_receipts
+Revision ID: 0006_shop_categories_receipts
 Revises: 0005_expense_categories
 Create Date: 2026-07-23 00:00:06.000000
 """
@@ -10,7 +10,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-revision: str = "0006_shopping_categories_receipts"
+revision: str = "0006_shop_categories_receipts"
 down_revision: Union[str, None] = "0005_expense_categories"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
