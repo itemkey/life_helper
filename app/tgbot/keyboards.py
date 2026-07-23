@@ -69,25 +69,94 @@ def list_keyboard(
     shopping_list: ShoppingList,
     items: Sequence[ShoppingItem],
     level: AccessLevel,
+    user_id: int | None = None,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for item in items:
         mark = "✓" if item.is_done else "□"
-        rows.append(
-            [
-                InlineKeyboardButton(text=f"{mark} {_short(item.text, 34)}", callback_data=f"toggle:{item.id}"),
-                InlineKeyboardButton(text="Удалить", callback_data=f"delitem:{item.id}"),
-            ]
-        )
+        row = [InlineKeyboardButton(text=f"{mark} {_short(item.text, 34)}", callback_data=f"toggle:{item.id}")]
+        can_delete = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
+        if can_delete:
+            row.append(InlineKeyboardButton(text="Удалить", callback_data=f"delitem:{item.id}"))
+        rows.append(row)
 
     rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"refresh:{shopping_list.id}")])
-    rows.append([InlineKeyboardButton(text="Добавить покупку", callback_data=f"add:{shopping_list.id}")])
-    rows.append([InlineKeyboardButton(text="Поставить все галочки", callback_data=f"checkall:{shopping_list.id}")])
-    rows.append([InlineKeyboardButton(text="Убрать все галочки", callback_data=f"uncheckall:{shopping_list.id}")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="Добавить в общее", callback_data=f"add_common:{shopping_list.id}"),
+            InlineKeyboardButton(text="Добавить в мой список", callback_data=f"add_personal:{shopping_list.id}"),
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="Деньги", callback_data=f"money:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Участники списка", callback_data=f"members:{shopping_list.id}")])
     if level == AccessLevel.owner:
         rows.append([InlineKeyboardButton(text="Настройки", callback_data=f"settings:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="К спискам", callback_data="lists")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def item_purchase_source_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Из кассы", callback_data="buy_source:cashbox"),
+                InlineKeyboardButton(text="Из своих", callback_data="buy_source:personal"),
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def money_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Взнос", callback_data=f"contribution:{shopping_list.id}"),
+                InlineKeyboardButton(text="Трата", callback_data=f"expense:{shopping_list.id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Такси", callback_data=f"taxi:{shopping_list.id}"),
+                InlineKeyboardButton(text="Итог", callback_data=f"money_final:{shopping_list.id}"),
+            ],
+            [InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{shopping_list.id}")],
+        ]
+    )
+
+
+def expense_source_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Из кассы", callback_data="expense_source:cashbox"),
+                InlineKeyboardButton(text="Из своих", callback_data="expense_source:personal"),
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def expense_split_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="На всех", callback_data="expense_split:all")],
+            [InlineKeyboardButton(text="Только на меня", callback_data="expense_split:me")],
+            [InlineKeyboardButton(text="Выбрать участников", callback_data="expense_split:selected")],
+            [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def expense_participants_keyboard(
+    participants: Sequence[User],
+    selected_user_ids: Sequence[int],
+) -> InlineKeyboardMarkup:
+    selected = set(selected_user_ids)
+    rows: list[list[InlineKeyboardButton]] = []
+    for user in participants:
+        mark = "✓" if user.id in selected else "□"
+        rows.append([InlineKeyboardButton(text=f"{mark} {_user_label(user)}", callback_data=f"expense_select:{user.id}")])
+    rows.append([InlineKeyboardButton(text="Готово", callback_data="expense_selected_done")])
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

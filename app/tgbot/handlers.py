@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -17,11 +18,16 @@ from app.services.errors import AccessDenied, LifeHelperError, ListNotFound, Val
 from app.tgbot.keyboards import (
     cancel_keyboard,
     delete_confirm_keyboard,
+    expense_participants_keyboard,
+    expense_source_keyboard,
+    expense_split_keyboard,
     home_keyboard,
+    item_purchase_source_keyboard,
     list_keyboard,
     lists_keyboard,
     members_keyboard,
     members_management_keyboard,
+    money_keyboard,
     settings_keyboard,
 )
 from app.tgbot.states import ShoppingListStates
@@ -30,6 +36,8 @@ from app.tgbot.texts import (
     WELCOME_TEXT,
     format_list_text,
     format_lists_text,
+    format_money_final_text,
+    format_money_text,
     format_members_management_text,
     format_members_text,
     format_settings_text,
@@ -147,7 +155,7 @@ async def _show_list(target: Message | CallbackQuery, session: AsyncSession, use
     sent_message = await _send_or_edit(
         target,
         format_list_text(shopping_list, items, level),
-        reply_markup=list_keyboard(shopping_list, items, level),
+        reply_markup=list_keyboard(shopping_list, items, level, user_id=user_id),
     )
     identity = _message_identity(sent_message)
     if identity is not None:
@@ -159,6 +167,26 @@ async def _show_list(target: Message | CallbackQuery, session: AsyncSession, use
             chat_id=chat_id,
             message_id=message_id,
         )
+
+
+async def _show_money(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
+    await _clear_current_list_view(target, session, user_id)
+    summary = await shopping.get_money_summary(session, user_id=user_id, list_id=list_id)
+    await _send_or_edit(
+        target,
+        format_money_text(summary),
+        reply_markup=money_keyboard(summary.shopping_list),
+    )
+
+
+async def _show_money_final(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
+    await _clear_current_list_view(target, session, user_id)
+    summary = await shopping.get_money_summary(session, user_id=user_id, list_id=list_id)
+    await _send_or_edit(
+        target,
+        format_money_final_text(summary),
+        reply_markup=money_keyboard(summary.shopping_list),
+    )
 
 
 async def _show_settings(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
@@ -250,7 +278,7 @@ async def _broadcast_public_list_update(
                 text=format_list_text(shopping_list, items, level),
                 chat_id=view_message.chat_id,
                 message_id=view_message.message_id,
-                reply_markup=list_keyboard(shopping_list, items, level),
+                reply_markup=list_keyboard(shopping_list, items, level, user_id=view_message.user_id),
             )
         except TelegramBadRequest as error:
             if "message is not modified" in str(error).lower():
@@ -384,6 +412,34 @@ async def callback_refresh_list(query: CallbackQuery, session: AsyncSession) -> 
         await _handle_service_error(query, error)
 
 
+@router.callback_query(F.data.startswith("money:"))
+async def callback_money(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    await state.clear()
+    list_id = _parse_id(query.data, "money:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_money(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("money_final:"))
+async def callback_money_final(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    await state.clear()
+    list_id = _parse_id(query.data, "money_final:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_money_final(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
 @router.callback_query(F.data.startswith("members:"))
 async def callback_members(query: CallbackQuery, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, query.from_user)
@@ -452,10 +508,16 @@ async def callback_member_ban(query: CallbackQuery, session: AsyncSession) -> No
         await _handle_service_error(query, error)
 
 
-@router.callback_query(F.data.startswith("add:"))
-async def callback_add_items(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+async def _start_add_items(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    *,
+    prefix: str,
+    scope: str,
+) -> None:
     user_id = await _ensure_user(session, query.from_user)
-    list_id = _parse_id(query.data, "add:")
+    list_id = _parse_id(query.data, prefix)
     if list_id is None:
         await _answer_callback(query, "Не понял кнопку.", show_alert=True)
         return
@@ -468,11 +530,49 @@ async def callback_add_items(query: CallbackQuery, state: FSMContext, session: A
     await shopping.clear_list_view_message(session, list_id=list_id, user_id=user_id)
     await session.commit()
     await state.set_state(ShoppingListStates.adding_items)
-    await state.update_data(list_id=list_id)
+    await state.update_data(list_id=list_id, item_scope=scope)
+    prompt = (
+        "Напиши покупки для общего списка. Можно несколькими строками."
+        if scope == shopping.ITEM_SCOPE_COMMON
+        else "Напиши личные хотелки для своего списка. Можно несколькими строками."
+    )
     await _send_or_edit(
         query,
-        "Напиши покупку. Можно отправить несколько строк, каждая строка станет отдельной покупкой.",
+        prompt,
         reply_markup=cancel_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("add:"))
+async def callback_add_items(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await _start_add_items(
+        query,
+        state,
+        session,
+        prefix="add:",
+        scope=shopping.ITEM_SCOPE_COMMON,
+    )
+
+
+@router.callback_query(F.data.startswith("add_common:"))
+async def callback_add_common_items(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await _start_add_items(
+        query,
+        state,
+        session,
+        prefix="add_common:",
+        scope=shopping.ITEM_SCOPE_COMMON,
+    )
+
+
+@router.callback_query(F.data.startswith("add_personal:"))
+async def callback_add_personal_items(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await _start_add_items(
+        query,
+        state,
+        session,
+        prefix="add_personal:",
+        scope=shopping.ITEM_SCOPE_PERSONAL,
     )
 
 
@@ -481,8 +581,15 @@ async def state_add_items(message: Message, state: FSMContext, bot: Bot, session
     user_id = await _ensure_user(session, message.from_user)
     data = await state.get_data()
     list_id = int(data.get("list_id", 0))
+    item_scope = str(data.get("item_scope", shopping.ITEM_SCOPE_COMMON))
     try:
-        await shopping.add_items(session, user_id=user_id, list_id=list_id, text=message.text or "")
+        await shopping.add_items(
+            session,
+            user_id=user_id,
+            list_id=list_id,
+            text=message.text or "",
+            scope=item_scope,
+        )
         await session.commit()
         await state.clear()
         await _show_list(message, session, user_id, list_id)
@@ -492,15 +599,71 @@ async def state_add_items(message: Message, state: FSMContext, bot: Bot, session
 
 
 @router.callback_query(F.data.startswith("toggle:"))
-async def callback_toggle_item(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+async def callback_toggle_item(
+    query: CallbackQuery,
+    bot: Bot,
+    session: AsyncSession,
+    state: FSMContext | None = None,
+) -> None:
     user_id = await _ensure_user(session, query.from_user)
     item_id = _parse_id(query.data, "toggle:")
     if item_id is None:
         await _answer_callback(query, "Не понял кнопку.", show_alert=True)
         return
     try:
-        list_id = await shopping.toggle_item(session, user_id=user_id, item_id=item_id)
+        _, item, _ = await shopping.get_item_view(session, user_id=user_id, item_id=item_id)
+        if item.is_done:
+            list_id = await shopping.unmark_item(session, user_id=user_id, item_id=item_id)
+            await session.commit()
+            await _show_list(query, session, user_id, list_id)
+            await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
+            return
+
+        if state is None:
+            await _answer_callback(query, "Не могу начать ввод цены.", show_alert=True)
+            return
+        await shopping.clear_list_view_message(session, list_id=item.list_id, user_id=user_id)
         await session.commit()
+        await state.set_state(ShoppingListStates.buying_item_amount)
+        await state.update_data(item_id=item.id, list_id=item.list_id)
+        await _send_or_edit(
+            query,
+            f"Сколько вышло за «{item.text}»? Напиши сумму, например 12.50.",
+            reply_markup=cancel_keyboard(),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.message(ShoppingListStates.buying_item_amount)
+async def state_buying_item_amount(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    await _ensure_user(session, message.from_user)
+    try:
+        amount = shopping.parse_money_amount(message.text or "")
+        await state.update_data(amount=amount)
+        await state.set_state(ShoppingListStates.choosing_item_purchase_source)
+        await message.answer("Откуда оплатили покупку?", reply_markup=item_purchase_source_keyboard())
+    except LifeHelperError as error:
+        await _handle_service_error(message, error)
+
+
+@router.callback_query(F.data.startswith("buy_source:"))
+async def callback_buy_source(query: CallbackQuery, state: FSMContext, bot: Bot, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    source = (query.data or "").removeprefix("buy_source:")
+    data = await state.get_data()
+    item_id = int(data.get("item_id", 0))
+    amount = int(data.get("amount", 0))
+    try:
+        list_id = await shopping.record_item_purchase(
+            session,
+            user_id=user_id,
+            item_id=item_id,
+            amount=amount,
+            source=source,
+        )
+        await session.commit()
+        await state.clear()
         await _show_list(query, session, user_id, list_id)
         await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
     except LifeHelperError as error:
@@ -568,6 +731,218 @@ async def callback_delete_item(query: CallbackQuery, bot: Bot, session: AsyncSes
         await session.commit()
         await _show_list(query, session, user_id, list_id)
         await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("contribution:"))
+async def callback_contribution(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "contribution:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await shopping.get_money_summary(session, user_id=user_id, list_id=list_id)
+        await state.set_state(ShoppingListStates.adding_contribution_amount)
+        await state.update_data(list_id=list_id)
+        await _send_or_edit(
+            query,
+            "Сколько ты внёс в кассу тусовки? Напиши сумму, например 50.",
+            reply_markup=cancel_keyboard(),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.message(ShoppingListStates.adding_contribution_amount)
+async def state_contribution_amount(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, message.from_user)
+    data = await state.get_data()
+    list_id = int(data.get("list_id", 0))
+    try:
+        await shopping.create_contribution(
+            session,
+            user_id=user_id,
+            list_id=list_id,
+            amount=message.text or "",
+        )
+        await state.clear()
+        await _show_money(message, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(message, error)
+
+
+@router.callback_query(F.data.startswith("expense:"))
+async def callback_expense(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "expense:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await shopping.get_money_summary(session, user_id=user_id, list_id=list_id)
+        await state.set_state(ShoppingListStates.adding_expense_title)
+        await state.update_data(list_id=list_id)
+        await _send_or_edit(query, "Как назвать трату?", reply_markup=cancel_keyboard())
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("taxi:"))
+async def callback_taxi(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "taxi:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await shopping.get_money_summary(session, user_id=user_id, list_id=list_id)
+        await state.set_state(ShoppingListStates.adding_expense_amount)
+        await state.update_data(list_id=list_id, expense_title="Такси")
+        await _send_or_edit(query, "Сколько стоило такси?", reply_markup=cancel_keyboard())
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.message(ShoppingListStates.adding_expense_title)
+async def state_expense_title(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    await _ensure_user(session, message.from_user)
+    try:
+        await state.update_data(expense_title=message.text or "")
+        await state.set_state(ShoppingListStates.adding_expense_amount)
+        await message.answer("Какая сумма?", reply_markup=cancel_keyboard())
+    except LifeHelperError as error:
+        await _handle_service_error(message, error)
+
+
+@router.message(ShoppingListStates.adding_expense_amount)
+async def state_expense_amount(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    await _ensure_user(session, message.from_user)
+    try:
+        amount = shopping.parse_money_amount(message.text or "")
+        await state.update_data(amount=amount)
+        await state.set_state(ShoppingListStates.choosing_expense_source)
+        await message.answer("Откуда оплатили?", reply_markup=expense_source_keyboard())
+    except LifeHelperError as error:
+        await _handle_service_error(message, error)
+
+
+@router.callback_query(F.data.startswith("expense_source:"))
+async def callback_expense_source(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await _ensure_user(session, query.from_user)
+    source = (query.data or "").removeprefix("expense_source:")
+    await state.update_data(source=source)
+    await state.set_state(ShoppingListStates.choosing_expense_split)
+    await _send_or_edit(query, "На кого распределить трату?", reply_markup=expense_split_keyboard())
+
+
+async def _create_expense_from_state(
+    target: Message | CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    *,
+    user_id: int,
+    share_user_ids: Sequence[int] | None,
+) -> None:
+    data = await state.get_data()
+    list_id = int(data.get("list_id", 0))
+    title = str(data.get("expense_title", ""))
+    amount = int(data.get("amount", 0))
+    source = str(data.get("source", ""))
+    await shopping.create_expense(
+        session,
+        user_id=user_id,
+        list_id=list_id,
+        title=title,
+        amount=amount,
+        source=source,
+        share_user_ids=share_user_ids,
+    )
+    await state.clear()
+    await _show_money(target, session, user_id, list_id)
+
+
+@router.callback_query(F.data == "expense_split:all")
+async def callback_expense_split_all(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    try:
+        await _create_expense_from_state(query, state, session, user_id=user_id, share_user_ids=None)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data == "expense_split:me")
+async def callback_expense_split_me(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    try:
+        await _create_expense_from_state(query, state, session, user_id=user_id, share_user_ids=[user_id])
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data == "expense_split:selected")
+async def callback_expense_split_selected(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    data = await state.get_data()
+    list_id = int(data.get("list_id", 0))
+    try:
+        _, participants, _ = await shopping.get_list_participants(session, user_id=user_id, list_id=list_id)
+        await state.update_data(selected_user_ids=[user_id])
+        await _send_or_edit(
+            query,
+            "Выбери участников для этой траты.",
+            reply_markup=expense_participants_keyboard(participants, [user_id]),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_select:"))
+async def callback_expense_select(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    selected_user_id = _parse_id(query.data, "expense_select:")
+    if selected_user_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    list_id = int(data.get("list_id", 0))
+    selected_user_ids = set(int(value) for value in data.get("selected_user_ids", []))
+    if selected_user_id in selected_user_ids:
+        selected_user_ids.remove(selected_user_id)
+    else:
+        selected_user_ids.add(selected_user_id)
+
+    try:
+        _, participants, _ = await shopping.get_list_participants(session, user_id=user_id, list_id=list_id)
+        selected = sorted(selected_user_ids)
+        await state.update_data(selected_user_ids=selected)
+        await _send_or_edit(
+            query,
+            "Выбери участников для этой траты.",
+            reply_markup=expense_participants_keyboard(participants, selected),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data == "expense_selected_done")
+async def callback_expense_selected_done(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    data = await state.get_data()
+    selected_user_ids = [int(value) for value in data.get("selected_user_ids", [])]
+    if not selected_user_ids:
+        await _answer_callback(query, "Выбери хотя бы одного участника.", show_alert=True)
+        return
+    try:
+        await _create_expense_from_state(
+            query,
+            state,
+            session,
+            user_id=user_id,
+            share_user_ids=selected_user_ids,
+        )
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 

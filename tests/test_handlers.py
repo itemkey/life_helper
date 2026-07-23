@@ -6,18 +6,27 @@ from aiogram.filters import CommandObject
 
 from app.db.models import ListViewMessage
 from app.services import shopping
+from app.tgbot.states import ShoppingListStates
 from app.tgbot.handlers import (
+    callback_buy_source,
+    callback_contribution,
     callback_delete_item,
     callback_check_all_items,
+    callback_expense_source,
+    callback_expense_split_all,
     callback_members,
     callback_members_manage,
     callback_member_ban,
     callback_member_remove,
     callback_refresh_list,
+    callback_taxi,
     callback_toggle_item,
     callback_uncheck_all_items,
     cmd_start,
     state_add_items,
+    state_buying_item_amount,
+    state_contribution_amount,
+    state_expense_amount,
 )
 from tests.conftest import FakeTelegramUser
 
@@ -278,6 +287,7 @@ async def test_toggle_and_delete_broadcast_public_list_updates_to_other_viewers(
     items = await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Молоко")
     await shopping.save_list_view_message(session, list_id=shopping_list.id, user_id=100, chat_id=1000, message_id=10)
     bot = FakeBot()
+    state = FakeState()
 
     await callback_toggle_item(
         FakeCallback(
@@ -287,10 +297,33 @@ async def test_toggle_and_delete_broadcast_public_list_updates_to_other_viewers(
         ),
         bot,
         session,
+        state=state,
+    )
+    assert state.data["state"] == ShoppingListStates.buying_item_amount
+
+    await state_buying_item_amount(
+        FakeMessage(from_user=FakeTelegramUser(id=200), text="12.50"),
+        state,
+        session,
+    )
+    assert state.data["state"] == ShoppingListStates.choosing_item_purchase_source
+
+    await callback_buy_source(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200),
+            data="buy_source:personal",
+            message=FakeEditableMessage(chat=FakeChat(2000), message_id=21),
+        ),
+        state,
+        bot,
+        session,
     )
 
     assert len(bot.edits) == 1
     assert "Молоко" in str(bot.edits[0]["text"])
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert len(summary.expenses) == 1
+    assert summary.expenses[0].amount == 1250
 
     bot.edits.clear()
     await callback_delete_item(
@@ -304,7 +337,7 @@ async def test_toggle_and_delete_broadcast_public_list_updates_to_other_viewers(
     )
 
     assert len(bot.edits) == 1
-    assert "Список пуст" in str(bot.edits[0]["text"])
+    assert "Тусовка пока пустая" in str(bot.edits[0]["text"])
 
 
 async def test_bulk_check_buttons_update_items_and_broadcast(session):
@@ -358,3 +391,63 @@ async def test_private_list_add_does_not_broadcast(session):
     await state_add_items(message, state, bot, session)
 
     assert bot.edits == []
+
+
+async def test_contribution_and_taxi_flow_updates_money_summary(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="owner", first_name="Owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="member", first_name="Member"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    state = FakeState()
+
+    await callback_contribution(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"contribution:{shopping_list.id}",
+            message=FakeEditableMessage(chat=FakeChat(1000), message_id=10),
+        ),
+        state,
+        session,
+    )
+    contribution_message = FakeMessage(from_user=FakeTelegramUser(id=100), text="100")
+    await state_contribution_amount(contribution_message, state, session)
+
+    assert contribution_message.answers
+    assert "100.00 BYN" in contribution_message.answers[0][0]
+
+    await callback_taxi(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200),
+            data=f"taxi:{shopping_list.id}",
+            message=FakeEditableMessage(chat=FakeChat(2000), message_id=20),
+        ),
+        state,
+        session,
+    )
+    await state_expense_amount(FakeMessage(from_user=FakeTelegramUser(id=200), text="30"), state, session)
+    await callback_expense_source(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200),
+            data="expense_source:cashbox",
+            message=FakeEditableMessage(chat=FakeChat(2000), message_id=21),
+        ),
+        state,
+        session,
+    )
+    await callback_expense_split_all(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200),
+            data="expense_split:all",
+            message=FakeEditableMessage(chat=FakeChat(2000), message_id=22),
+        ),
+        state,
+        session,
+    )
+
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert summary.cashbox_balance == 7000
+    assert [(expense.title, expense.amount, expense.source) for expense in summary.expenses] == [
+        ("Такси", 3000, shopping.EXPENSE_SOURCE_CASHBOX)
+    ]
+    assert {balance.user.id: balance.balance for balance in summary.balances} == {100: 8500, 200: -1500}

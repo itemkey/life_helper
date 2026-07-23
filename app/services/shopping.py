@@ -1,14 +1,60 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.db.models import ListBannedMember, ListMember, ListViewMessage, ShoppingItem, ShoppingList, User
+from app.db.models import (
+    Contribution,
+    Expense,
+    ExpenseShare,
+    ListBannedMember,
+    ListMember,
+    ListViewMessage,
+    ShoppingItem,
+    ShoppingList,
+    User,
+)
 from app.services.access import AccessLevel, require_access
 from app.services.errors import AccessDenied, ListNotFound, ValidationError
 from app.services.tokens import generate_public_token, hash_public_token
+
+
+ITEM_SCOPE_COMMON = "common"
+ITEM_SCOPE_PERSONAL = "personal"
+EXPENSE_SOURCE_CASHBOX = "cashbox"
+EXPENSE_SOURCE_PERSONAL = "personal"
+
+
+@dataclass(frozen=True)
+class ParticipantBalance:
+    user: User
+    contributed: int
+    paid_personal: int
+    share: int
+    balance: int
+
+
+@dataclass(frozen=True)
+class Settlement:
+    from_user: User
+    to_user: User
+    amount: int
+
+
+@dataclass(frozen=True)
+class MoneySummary:
+    shopping_list: ShoppingList
+    participants: Sequence[User]
+    contributions: Sequence[Contribution]
+    expenses: Sequence[Expense]
+    balances: Sequence[ParticipantBalance]
+    settlements: Sequence[Settlement]
+    cashbox_balance: int
 
 
 def _normalize_title(title: str) -> str:
@@ -31,6 +77,54 @@ def _normalize_item_lines(text: str) -> list[str]:
     return lines
 
 
+def _normalize_expense_title(title: str) -> str:
+    value = " ".join(title.strip().split())
+    if not value:
+        raise ValidationError("Название траты не может быть пустым.")
+    if len(value) > 255:
+        raise ValidationError("Название траты должно быть не длиннее 255 символов.")
+    return value
+
+
+def parse_money_amount(value: str | int) -> int:
+    if isinstance(value, int):
+        amount = value
+    else:
+        normalized = value.strip().replace(" ", "").replace(",", ".")
+        if not normalized:
+            raise ValidationError("Напиши сумму, например 25.50.")
+        try:
+            decimal = Decimal(normalized)
+        except InvalidOperation as error:
+            raise ValidationError("Не понял сумму. Напиши число вроде 25 или 25.50.") from error
+        if decimal.as_tuple().exponent < -2:
+            raise ValidationError("Сумма должна быть с точностью до копеек.")
+        amount = int(decimal * 100)
+
+    if amount <= 0:
+        raise ValidationError("Сумма должна быть больше нуля.")
+    return amount
+
+
+def format_money_amount(amount: int, currency: str = "BYN") -> str:
+    sign = "-" if amount < 0 else ""
+    absolute = abs(amount)
+    return f"{sign}{absolute // 100}.{absolute % 100:02d} {currency}"
+
+
+def _split_amount(amount: int, user_ids: Sequence[int]) -> dict[int, int]:
+    ordered_user_ids = list(dict.fromkeys(user_ids))
+    if not ordered_user_ids:
+        raise ValidationError("Нужно выбрать хотя бы одного участника для распределения траты.")
+
+    base = amount // len(ordered_user_ids)
+    remainder = amount % len(ordered_user_ids)
+    return {
+        user_id: base + (1 if index < remainder else 0)
+        for index, user_id in enumerate(ordered_user_ids)
+    }
+
+
 async def upsert_user(session: AsyncSession, telegram_user: object) -> User:
     user_id = int(getattr(telegram_user, "id"))
     user = await session.get(User, user_id)
@@ -47,7 +141,12 @@ async def upsert_user(session: AsyncSession, telegram_user: object) -> User:
 
 
 async def create_shopping_list(session: AsyncSession, *, owner_id: int, title: str) -> ShoppingList:
-    shopping_list = ShoppingList(owner_id=owner_id, title=_normalize_title(title))
+    shopping_list = ShoppingList(
+        owner_id=owner_id,
+        cashbox_holder_id=owner_id,
+        title=_normalize_title(title),
+        currency="BYN",
+    )
     session.add(shopping_list)
     await session.flush()
     return shopping_list
@@ -72,6 +171,51 @@ async def list_owned_and_shared(
     return owned_result.all(), shared_result.all()
 
 
+async def _get_participant_users(session: AsyncSession, shopping_list: ShoppingList) -> list[User]:
+    owner = await session.get(User, shopping_list.owner_id)
+    if owner is None:
+        raise ListNotFound("Владелец списка не найден.")
+
+    members_result = await session.scalars(
+        select(User)
+        .join(ListMember, ListMember.user_id == User.id)
+        .where(ListMember.list_id == shopping_list.id)
+        .order_by(ListMember.joined_at.asc(), User.id.asc())
+    )
+    return [owner, *members_result.all()]
+
+
+async def get_list_participants(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    list_id: int,
+) -> tuple[ShoppingList, Sequence[User], AccessLevel]:
+    shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
+    return shopping_list, await _get_participant_users(session, shopping_list), level
+
+
+async def _participant_user_ids(session: AsyncSession, shopping_list: ShoppingList) -> list[int]:
+    return [user.id for user in await _get_participant_users(session, shopping_list)]
+
+
+async def _normalize_share_user_ids(
+    session: AsyncSession,
+    shopping_list: ShoppingList,
+    share_user_ids: Sequence[int] | None,
+) -> list[int]:
+    participants = await _get_participant_users(session, shopping_list)
+    participant_ids = [user.id for user in participants]
+    if share_user_ids is None:
+        return participant_ids
+
+    requested = set(share_user_ids)
+    selected = [user_id for user_id in participant_ids if user_id in requested]
+    if len(selected) != len(requested):
+        raise ValidationError("Можно распределять траты только между участниками тусовки.")
+    return selected
+
+
 async def get_list_view(
     session: AsyncSession,
     *,
@@ -81,6 +225,7 @@ async def get_list_view(
     shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
     items = await session.scalars(
         select(ShoppingItem)
+        .options(selectinload(ShoppingItem.author), selectinload(ShoppingItem.personal_owner))
         .where(ShoppingItem.list_id == list_id)
         .order_by(ShoppingItem.position.asc(), ShoppingItem.id.asc())
     )
@@ -192,6 +337,7 @@ async def get_public_list_update_view(
 
     items = await session.scalars(
         select(ShoppingItem)
+        .options(selectinload(ShoppingItem.author), selectinload(ShoppingItem.personal_owner))
         .where(ShoppingItem.list_id == list_id)
         .order_by(ShoppingItem.position.asc(), ShoppingItem.id.asc())
     )
@@ -222,8 +368,12 @@ async def add_items(
     user_id: int,
     list_id: int,
     text: str,
+    scope: str = ITEM_SCOPE_COMMON,
 ) -> list[ShoppingItem]:
     shopping_list, _ = await require_access(session, user_id=user_id, list_id=list_id)
+    if scope not in {ITEM_SCOPE_COMMON, ITEM_SCOPE_PERSONAL}:
+        raise ValidationError("Не понял, в какой список добавить покупку.")
+
     lines = _normalize_item_lines(text)
     locked_list = await session.scalar(
         select(ShoppingList).where(ShoppingList.id == shopping_list.id).with_for_update()
@@ -243,11 +393,44 @@ async def add_items(
             text=line,
             position=position,
             author_id=user_id,
+            scope=scope,
+            personal_owner_id=user_id if scope == ITEM_SCOPE_PERSONAL else None,
         )
         session.add(item)
         items.append(item)
     await session.flush()
     return items
+
+
+async def _get_item_with_access(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    item_id: int,
+) -> tuple[ShoppingList, ShoppingItem, AccessLevel]:
+    item = await session.scalar(
+        select(ShoppingItem)
+        .options(selectinload(ShoppingItem.personal_owner))
+        .where(ShoppingItem.id == item_id)
+    )
+    if item is None:
+        raise ListNotFound("Покупка не найдена.")
+    shopping_list, level = await require_access(session, user_id=user_id, list_id=item.list_id)
+    return shopping_list, item, level
+
+
+def _ensure_item_edit_allowed(
+    *,
+    shopping_list: ShoppingList,
+    item: ShoppingItem,
+    user_id: int,
+    level: AccessLevel,
+) -> None:
+    if item.scope != ITEM_SCOPE_PERSONAL:
+        return
+    if level == AccessLevel.owner or item.personal_owner_id == user_id:
+        return
+    raise AccessDenied("В чужой личный список можно смотреть, но нельзя удалять или редактировать.")
 
 
 async def toggle_item(
@@ -256,11 +439,21 @@ async def toggle_item(
     user_id: int,
     item_id: int,
 ) -> int:
-    item = await session.get(ShoppingItem, item_id)
-    if item is None:
-        raise ListNotFound("Покупка не найдена.")
-    await require_access(session, user_id=user_id, list_id=item.list_id)
+    _, item, _ = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
     item.is_done = not item.is_done
+    await session.flush()
+    return item.list_id
+
+
+async def unmark_item(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    item_id: int,
+) -> int:
+    _, item, _ = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
+    item.is_done = False
+    await session.execute(delete(Expense).where(Expense.item_id == item.id))
     await session.flush()
     return item.list_id
 
@@ -288,14 +481,231 @@ async def delete_item(
     user_id: int,
     item_id: int,
 ) -> int:
-    item = await session.get(ShoppingItem, item_id)
-    if item is None:
-        raise ListNotFound("Покупка не найдена.")
+    shopping_list, item, level = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
+    _ensure_item_edit_allowed(shopping_list=shopping_list, item=item, user_id=user_id, level=level)
     list_id = item.list_id
-    await require_access(session, user_id=user_id, list_id=list_id)
     await session.delete(item)
     await session.flush()
     return list_id
+
+
+async def get_item_view(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    item_id: int,
+) -> tuple[ShoppingList, ShoppingItem, AccessLevel]:
+    return await _get_item_with_access(session, user_id=user_id, item_id=item_id)
+
+
+async def create_contribution(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    list_id: int,
+    amount: str | int,
+    contributor_id: int | None = None,
+    note: str | None = None,
+) -> Contribution:
+    shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
+    contributor_id = contributor_id or user_id
+    if contributor_id != user_id and level != AccessLevel.owner:
+        raise AccessDenied("Записать взнос за другого участника может только владелец тусовки.")
+
+    participant_ids = await _participant_user_ids(session, shopping_list)
+    if contributor_id not in participant_ids:
+        raise ValidationError("Взнос можно записать только за участника тусовки.")
+
+    normalized_note = " ".join(note.strip().split()) if note else None
+    contribution = Contribution(
+        list_id=shopping_list.id,
+        user_id=contributor_id,
+        amount=parse_money_amount(amount),
+        note=normalized_note[:255] if normalized_note else None,
+        created_by_id=user_id,
+    )
+    session.add(contribution)
+    await session.flush()
+    return contribution
+
+
+async def create_expense(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    list_id: int,
+    title: str,
+    amount: str | int,
+    source: str,
+    share_user_ids: Sequence[int] | None = None,
+    payer_id: int | None = None,
+    item_id: int | None = None,
+) -> Expense:
+    shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
+    payer_id = payer_id or user_id
+    if payer_id != user_id and level != AccessLevel.owner:
+        raise AccessDenied("Записать оплату за другого участника может только владелец тусовки.")
+    if source not in {EXPENSE_SOURCE_CASHBOX, EXPENSE_SOURCE_PERSONAL}:
+        raise ValidationError("Не понял источник оплаты.")
+
+    participant_ids = await _participant_user_ids(session, shopping_list)
+    if payer_id not in participant_ids:
+        raise ValidationError("Плательщик должен быть участником тусовки.")
+
+    selected_share_user_ids = await _normalize_share_user_ids(session, shopping_list, share_user_ids)
+    amount_minor = parse_money_amount(amount)
+    shares = _split_amount(amount_minor, selected_share_user_ids)
+    expense = Expense(
+        list_id=shopping_list.id,
+        title=_normalize_expense_title(title),
+        amount=amount_minor,
+        payer_id=payer_id,
+        source=source,
+        item_id=item_id,
+        created_by_id=user_id,
+    )
+    session.add(expense)
+    await session.flush()
+    for share_user_id, share_amount in shares.items():
+        session.add(ExpenseShare(expense_id=expense.id, user_id=share_user_id, amount=share_amount))
+    await session.flush()
+    return expense
+
+
+async def record_item_purchase(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    item_id: int,
+    amount: str | int,
+    source: str,
+) -> int:
+    _, item, _ = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
+    if item.is_done:
+        raise ValidationError("Эта покупка уже отмечена купленной.")
+
+    if item.scope == ITEM_SCOPE_PERSONAL:
+        share_user_ids = [int(item.personal_owner_id)]
+    else:
+        share_user_ids = None
+
+    await create_expense(
+        session,
+        user_id=user_id,
+        list_id=item.list_id,
+        title=item.text,
+        amount=amount,
+        source=source,
+        share_user_ids=share_user_ids,
+        payer_id=user_id,
+        item_id=item.id,
+    )
+    item.is_done = True
+    await session.flush()
+    return item.list_id
+
+
+def _build_settlements(balances: Sequence[ParticipantBalance]) -> list[Settlement]:
+    creditors = [
+        [balance.user, balance.balance]
+        for balance in balances
+        if balance.balance > 0
+    ]
+    debtors = [
+        [balance.user, -balance.balance]
+        for balance in balances
+        if balance.balance < 0
+    ]
+    settlements: list[Settlement] = []
+    creditor_index = 0
+    debtor_index = 0
+
+    while creditor_index < len(creditors) and debtor_index < len(debtors):
+        debtor_user, debt_amount = debtors[debtor_index]
+        creditor_user, credit_amount = creditors[creditor_index]
+        amount = min(debt_amount, credit_amount)
+        settlements.append(Settlement(from_user=debtor_user, to_user=creditor_user, amount=amount))
+        debtors[debtor_index][1] -= amount
+        creditors[creditor_index][1] -= amount
+        if debtors[debtor_index][1] == 0:
+            debtor_index += 1
+        if creditors[creditor_index][1] == 0:
+            creditor_index += 1
+
+    return settlements
+
+
+async def get_money_summary(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    list_id: int,
+) -> MoneySummary:
+    shopping_list, _ = await require_access(session, user_id=user_id, list_id=list_id)
+    participants = await _get_participant_users(session, shopping_list)
+    participant_ids = {participant.id for participant in participants}
+
+    contributions = (
+        await session.scalars(
+            select(Contribution)
+            .options(selectinload(Contribution.user), selectinload(Contribution.created_by))
+            .where(Contribution.list_id == shopping_list.id)
+            .order_by(Contribution.created_at.asc(), Contribution.id.asc())
+        )
+    ).all()
+    expenses = (
+        await session.scalars(
+            select(Expense)
+            .options(
+                selectinload(Expense.payer),
+                selectinload(Expense.item),
+                selectinload(Expense.shares).selectinload(ExpenseShare.user),
+            )
+            .where(Expense.list_id == shopping_list.id)
+            .order_by(Expense.created_at.asc(), Expense.id.asc())
+        )
+    ).all()
+
+    contributed_by_user = {participant.id: 0 for participant in participants}
+    paid_personal_by_user = {participant.id: 0 for participant in participants}
+    share_by_user = {participant.id: 0 for participant in participants}
+
+    for contribution in contributions:
+        if contribution.user_id in participant_ids:
+            contributed_by_user[contribution.user_id] += contribution.amount
+
+    cashbox_expense_total = 0
+    for expense in expenses:
+        if expense.source == EXPENSE_SOURCE_CASHBOX:
+            cashbox_expense_total += expense.amount
+        elif expense.payer_id in participant_ids:
+            paid_personal_by_user[expense.payer_id] += expense.amount
+
+        for share in expense.shares:
+            if share.user_id in participant_ids:
+                share_by_user[share.user_id] += share.amount
+
+    balances = [
+        ParticipantBalance(
+            user=participant,
+            contributed=contributed_by_user[participant.id],
+            paid_personal=paid_personal_by_user[participant.id],
+            share=share_by_user[participant.id],
+            balance=contributed_by_user[participant.id]
+            + paid_personal_by_user[participant.id]
+            - share_by_user[participant.id],
+        )
+        for participant in participants
+    ]
+    return MoneySummary(
+        shopping_list=shopping_list,
+        participants=participants,
+        contributions=contributions,
+        expenses=expenses,
+        balances=balances,
+        settlements=_build_settlements(balances),
+        cashbox_balance=sum(contributed_by_user.values()) - cashbox_expense_total,
+    )
 
 
 async def rename_list(
@@ -322,6 +732,44 @@ async def delete_list(
     await session.flush()
 
 
+async def _cleanup_removed_member(session: AsyncSession, *, list_id: int, member_user_id: int) -> None:
+    expense_ids = select(Expense.id).where(Expense.list_id == list_id)
+    paid_expense_ids = select(Expense.id).where(
+        Expense.list_id == list_id,
+        Expense.payer_id == member_user_id,
+    )
+    await session.execute(
+        delete(ShoppingItem).where(
+            ShoppingItem.list_id == list_id,
+            ShoppingItem.scope == ITEM_SCOPE_PERSONAL,
+            ShoppingItem.personal_owner_id == member_user_id,
+        )
+    )
+    await session.execute(
+        delete(ExpenseShare).where(
+            or_(
+                ExpenseShare.expense_id.in_(paid_expense_ids),
+                and_(
+                    ExpenseShare.expense_id.in_(expense_ids),
+                    ExpenseShare.user_id == member_user_id,
+                ),
+            )
+        )
+    )
+    await session.execute(
+        delete(Expense).where(
+            Expense.list_id == list_id,
+            Expense.payer_id == member_user_id,
+        )
+    )
+    await session.execute(
+        delete(Contribution).where(
+            Contribution.list_id == list_id,
+            Contribution.user_id == member_user_id,
+        )
+    )
+
+
 async def remove_list_member(
     session: AsyncSession,
     *,
@@ -338,6 +786,7 @@ async def remove_list_member(
         raise ListNotFound("Участник не найден.")
 
     await session.delete(membership)
+    await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_user_id)
     await clear_list_view_message(session, list_id=list_id, user_id=member_user_id)
     await session.flush()
     return shopping_list
@@ -364,6 +813,7 @@ async def ban_list_member(
         session.add(ListBannedMember(list_id=list_id, user_id=member_user_id))
 
     await session.delete(membership)
+    await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_user_id)
     await clear_list_view_message(session, list_id=list_id, user_id=member_user_id)
     await session.flush()
     return shopping_list
@@ -410,6 +860,11 @@ async def disable_public_access(
     shopping_list.is_public = False
     shopping_list.public_token = None
     shopping_list.public_token_hash = None
+    member_ids = (
+        await session.scalars(select(ListMember.user_id).where(ListMember.list_id == list_id))
+    ).all()
+    for member_id in member_ids:
+        await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_id)
     await session.execute(delete(ListMember).where(ListMember.list_id == list_id))
     await session.execute(
         delete(ListViewMessage).where(

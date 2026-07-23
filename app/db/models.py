@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -34,6 +34,7 @@ class User(TimestampMixin, Base):
     owned_lists: Mapped[list[ShoppingList]] = relationship(
         back_populates="owner",
         cascade="all, delete-orphan",
+        foreign_keys="ShoppingList.owner_id",
     )
     list_view_messages: Mapped[list[ListViewMessage]] = relationship(
         back_populates="user",
@@ -59,8 +60,16 @@ class ShoppingList(TimestampMixin, Base):
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     public_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     public_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="BYN", server_default="BYN")
+    cashbox_holder_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
-    owner: Mapped[User] = relationship(back_populates="owned_lists")
+    owner: Mapped[User] = relationship(back_populates="owned_lists", foreign_keys=[owner_id])
+    cashbox_holder: Mapped[User | None] = relationship(foreign_keys=[cashbox_holder_id])
     items: Mapped[list[ShoppingItem]] = relationship(
         back_populates="shopping_list",
         cascade="all, delete-orphan",
@@ -78,10 +87,26 @@ class ShoppingList(TimestampMixin, Base):
         back_populates="shopping_list",
         cascade="all, delete-orphan",
     )
+    contributions: Mapped[list[Contribution]] = relationship(
+        back_populates="shopping_list",
+        cascade="all, delete-orphan",
+    )
+    expenses: Mapped[list[Expense]] = relationship(
+        back_populates="shopping_list",
+        cascade="all, delete-orphan",
+    )
 
 
 class ShoppingItem(TimestampMixin, Base):
     __tablename__ = "shopping_items"
+    __table_args__ = (
+        CheckConstraint("scope in ('common', 'personal')", name="ck_shopping_items_scope"),
+        CheckConstraint(
+            "(scope = 'common' and personal_owner_id is null) or "
+            "(scope = 'personal' and personal_owner_id is not null)",
+            name="ck_shopping_items_scope_owner",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     list_id: Mapped[int] = mapped_column(
@@ -99,9 +124,18 @@ class ShoppingItem(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    scope: Mapped[str] = mapped_column(String(16), nullable=False, default="common", server_default="common")
+    personal_owner_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     shopping_list: Mapped[ShoppingList] = relationship(back_populates="items")
-    author: Mapped[User | None] = relationship()
+    author: Mapped[User | None] = relationship(foreign_keys=[author_id])
+    personal_owner: Mapped[User | None] = relationship(foreign_keys=[personal_owner_id])
+    expenses: Mapped[list[Expense]] = relationship(back_populates="item")
 
 
 class ListViewMessage(TimestampMixin, Base):
@@ -170,3 +204,98 @@ class ListBannedMember(Base):
 
     shopping_list: Mapped[ShoppingList] = relationship(back_populates="banned_members")
     user: Mapped[User] = relationship(back_populates="banned_memberships")
+
+
+class Contribution(TimestampMixin, Base):
+    __tablename__ = "contributions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    list_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("shopping_lists.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_by_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    shopping_list: Mapped[ShoppingList] = relationship(back_populates="contributions")
+    user: Mapped[User] = relationship(foreign_keys=[user_id])
+    created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
+
+
+class Expense(TimestampMixin, Base):
+    __tablename__ = "expenses"
+    __table_args__ = (
+        CheckConstraint("source in ('cashbox', 'personal')", name="ck_expenses_source"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    list_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("shopping_lists.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    payer_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    item_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("shopping_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_by_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    shopping_list: Mapped[ShoppingList] = relationship(back_populates="expenses")
+    payer: Mapped[User] = relationship(foreign_keys=[payer_id])
+    item: Mapped[ShoppingItem | None] = relationship(back_populates="expenses")
+    created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
+    shares: Mapped[list[ExpenseShare]] = relationship(
+        back_populates="expense",
+        cascade="all, delete-orphan",
+        order_by="ExpenseShare.user_id",
+    )
+
+
+class ExpenseShare(Base):
+    __tablename__ = "expense_shares"
+
+    expense_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("expenses.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    expense: Mapped[Expense] = relationship(back_populates="shares")
+    user: Mapped[User] = relationship()
