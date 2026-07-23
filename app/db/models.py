@@ -163,7 +163,10 @@ class ShoppingCategory(TimestampMixin, Base):
     __tablename__ = "shopping_categories"
     __table_args__ = (
         CheckConstraint("scope in ('common', 'personal')", name="ck_shopping_categories_scope"),
-        CheckConstraint("accounting_mode in ('per_item', 'receipt')", name="ck_shopping_categories_accounting_mode"),
+        CheckConstraint(
+            "accounting_mode in ('per_item', 'receipt', 'checklist')",
+            name="ck_shopping_categories_accounting_mode",
+        ),
         CheckConstraint(
             "(scope = 'common' and owner_id is null) or "
             "(scope = 'personal' and owner_id is not null)",

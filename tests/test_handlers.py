@@ -35,6 +35,7 @@ from app.tgbot.handlers import (
     callback_shopping_category_add_common,
     callback_shopping_category_delete,
     callback_shopping_category_mode,
+    callback_shopping_category_settings,
     callback_toggle_item,
     callback_uncheck_all_items,
     cmd_start,
@@ -358,6 +359,46 @@ async def test_toggle_and_delete_broadcast_public_list_updates_to_other_viewers(
     assert "Тусовка пока пустая" in str(bot.edits[0]["text"])
 
 
+async def test_toggle_checklist_item_marks_done_without_price_flow(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    category = await shopping.create_shopping_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Взять",
+        scope=shopping.ITEM_SCOPE_COMMON,
+        accounting_mode=shopping.SHOPPING_CATEGORY_MODE_CHECKLIST,
+    )
+    item = (
+        await shopping.add_items(
+            session,
+            user_id=100,
+            list_id=shopping_list.id,
+            text="Плед",
+            category_id=category.id,
+        )
+    )[0]
+    state = FakeState()
+
+    await callback_toggle_item(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"toggle:{item.id}",
+            message=FakeEditableMessage(chat=FakeChat(1000), message_id=20),
+        ),
+        FakeBot(),
+        session,
+        state=state,
+    )
+
+    await session.refresh(item)
+    assert item.is_done is True
+    assert state.data == {}
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert summary.expenses == []
+
+
 async def test_bulk_check_buttons_update_items_and_broadcast(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     await shopping.upsert_user(session, FakeTelegramUser(id=200))
@@ -529,6 +570,29 @@ async def test_shopping_category_add_and_receipt_mode_flow(session):
     )
     await session.refresh(category)
     assert category.accounting_mode == shopping.SHOPPING_CATEGORY_MODE_RECEIPT
+
+
+async def test_shopping_category_settings_handler_opens_settings_screen(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=shopping_list.id)
+    category = next(item for item in categories if item.scope == shopping.ITEM_SCOPE_COMMON)
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_shopping_category_settings(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"shopping_category_settings:{category.id}",
+            message=query_message,
+        ),
+        session,
+    )
+
+    assert query_message.edits
+    assert "Настройки" in query_message.edits[-1][0]
+    buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
+    assert any(button.callback_data.startswith("shopping_category_mode:") for button in buttons)
+    assert any(button.text == "Назад" and button.callback_data == f"shopping_category:{category.id}" for button in buttons)
 
 
 async def test_shopping_category_delete_handler_removes_empty_category(session):

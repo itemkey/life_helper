@@ -31,6 +31,7 @@ ITEM_SCOPE_COMMON = "common"
 ITEM_SCOPE_PERSONAL = "personal"
 SHOPPING_CATEGORY_MODE_PER_ITEM = "per_item"
 SHOPPING_CATEGORY_MODE_RECEIPT = "receipt"
+SHOPPING_CATEGORY_MODE_CHECKLIST = "checklist"
 EXPENSE_SOURCE_CASHBOX = "cashbox"
 EXPENSE_SOURCE_PERSONAL = "personal"
 EXPENSE_SPLIT_ALL = "all"
@@ -215,7 +216,11 @@ def _validate_shopping_category_scope(scope: str) -> None:
 
 
 def _validate_shopping_category_mode(accounting_mode: str) -> None:
-    if accounting_mode not in {SHOPPING_CATEGORY_MODE_PER_ITEM, SHOPPING_CATEGORY_MODE_RECEIPT}:
+    if accounting_mode not in {
+        SHOPPING_CATEGORY_MODE_PER_ITEM,
+        SHOPPING_CATEGORY_MODE_RECEIPT,
+        SHOPPING_CATEGORY_MODE_CHECKLIST,
+    }:
         raise ValidationError("Не понял режим расчёта категории покупок.")
 
 
@@ -1120,6 +1125,8 @@ async def record_item_purchase(
 
     if item.category is not None and item.category.accounting_mode == SHOPPING_CATEGORY_MODE_RECEIPT:
         raise ValidationError("Эта категория считается по чеку. Открой категорию и внеси общий чек.")
+    if item.category is not None and item.category.accounting_mode == SHOPPING_CATEGORY_MODE_CHECKLIST:
+        raise ValidationError("Эта категория без денег. Отметь вещь взятой без цены.")
 
     if item.scope == ITEM_SCOPE_PERSONAL:
         share_user_ids = [int(item.personal_owner_id)]

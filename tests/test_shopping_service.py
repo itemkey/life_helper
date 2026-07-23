@@ -343,6 +343,44 @@ async def test_shopping_category_delete_rejects_last_required_categories(session
         await shopping.delete_shopping_category(session, user_id=100, category_id=personal_category.id)
 
 
+async def test_checklist_shopping_category_items_do_not_create_purchases(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    category = await shopping.create_shopping_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Взять с собой",
+        scope=shopping.ITEM_SCOPE_COMMON,
+    )
+    await shopping.set_shopping_category_accounting_mode(
+        session,
+        user_id=100,
+        category_id=category.id,
+        accounting_mode=shopping.SHOPPING_CATEGORY_MODE_CHECKLIST,
+    )
+    item = (
+        await shopping.add_items(
+            session,
+            user_id=100,
+            list_id=shopping_list.id,
+            text="Плед",
+            category_id=category.id,
+        )
+    )[0]
+
+    with pytest.raises(ValidationError, match="без денег"):
+        await shopping.record_item_purchase(
+            session,
+            user_id=100,
+            item_id=item.id,
+            amount="10",
+            source=shopping.EXPENSE_SOURCE_PERSONAL,
+        )
+
+    assert (await session.scalars(select(Expense))).all() == []
+
+
 async def test_receipt_purchase_links_multiple_items_and_can_be_cancelled(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     await shopping.upsert_user(session, FakeTelegramUser(id=200))

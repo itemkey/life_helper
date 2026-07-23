@@ -14,6 +14,7 @@ from app.tgbot.keyboards import (
     receipt_items_keyboard,
     shopping_categories_keyboard,
     shopping_category_keyboard,
+    shopping_category_settings_keyboard,
 )
 
 
@@ -35,13 +36,13 @@ def test_list_keyboard_has_members_button():
     assert any(button.text == "Участники списка" and button.callback_data == "members:1" for button in buttons)
 
 
-def test_list_keyboard_has_common_personal_and_money_buttons():
+def test_list_keyboard_has_categories_and_money_buttons():
     shopping_list = ShoppingList(id=1, owner_id=100, title="Дом")
 
     keyboard = list_keyboard(shopping_list, [], AccessLevel.member)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.text == "Добавить" and button.callback_data == "add:1" for button in buttons)
+    assert not any(button.text == "Добавить" for button in buttons)
     assert any(
         button.text == "Категории покупок" and button.callback_data == "shopping_categories:1"
         for button in buttons
@@ -117,7 +118,7 @@ def test_shopping_categories_keyboard_has_add_and_open_actions():
     assert any(button.text == "Добавить личную" and button.callback_data == "shopping_category_add_personal:1" for button in buttons)
 
 
-def test_receipt_category_keyboard_has_receipt_and_mode_actions():
+def test_shopping_category_keyboard_has_main_actions():
     category = ShoppingCategory(
         id=10,
         list_id=1,
@@ -131,8 +132,50 @@ def test_receipt_category_keyboard_has_receipt_and_mode_actions():
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
     assert any(button.text == "Чек" and button.callback_data == "receipt:10" for button in buttons)
-    assert any(button.text == "Считать по товарам" and button.callback_data == "shopping_category_mode:10:per_item" for button in buttons)
+    assert any(button.text == "Добавить товар" and button.callback_data == "add_category:10" for button in buttons)
+    assert any(button.text == "Настройки" and button.callback_data == "shopping_category_settings:10" for button in buttons)
+    assert any(button.text == "Назад" and button.callback_data == "shopping_categories:1" for button in buttons)
+    assert not any(button.text == "Считать по товарам" for button in buttons)
+    assert not any(button.text == "Удалить" for button in buttons)
+
+
+def test_shopping_category_settings_keyboard_has_mode_rename_delete_and_back_actions():
+    category = ShoppingCategory(
+        id=10,
+        list_id=1,
+        title="Магазин",
+        scope="common",
+        accounting_mode="receipt",
+        position=1,
+    )
+
+    keyboard = shopping_category_settings_keyboard(category, AccessLevel.owner, user_id=100)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert any(button.text == "Покупки по товарам" and button.callback_data == "shopping_category_mode:10:per_item" for button in buttons)
+    assert any(button.text == "✓ Покупки по чеку" and button.callback_data == "shopping_category_mode:10:receipt" for button in buttons)
+    assert any(button.text == "Вещи взять" and button.callback_data == "shopping_category_mode:10:checklist" for button in buttons)
     assert any(button.text == "Удалить" and button.callback_data == "shopping_category_delete:10" for button in buttons)
+    assert any(button.text == "Переименовать" and button.callback_data == "shopping_category_rename:10" for button in buttons)
+    assert any(button.text == "Назад" and button.callback_data == "shopping_category:10" for button in buttons)
+
+
+def test_checklist_shopping_category_keyboard_has_no_receipt_action():
+    category = ShoppingCategory(
+        id=10,
+        list_id=1,
+        title="Взять",
+        scope="common",
+        accounting_mode="checklist",
+        position=1,
+    )
+
+    keyboard = shopping_category_keyboard(category, AccessLevel.owner, user_id=100)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert any(button.text == "Добавить вещь" and button.callback_data == "add_category:10" for button in buttons)
+    assert not any(button.text == "Чек" for button in buttons)
+    assert any(button.text == "Настройки" and button.callback_data == "shopping_category_settings:10" for button in buttons)
 
 
 def test_receipt_items_and_default_split_keyboards():

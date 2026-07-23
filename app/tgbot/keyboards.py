@@ -81,12 +81,7 @@ def list_keyboard(
         rows.append(row)
 
     rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"refresh:{shopping_list.id}")])
-    rows.append(
-        [
-            InlineKeyboardButton(text="Добавить", callback_data=f"add:{shopping_list.id}"),
-            InlineKeyboardButton(text="Категории покупок", callback_data=f"shopping_categories:{shopping_list.id}"),
-        ]
-    )
+    rows.append([InlineKeyboardButton(text="Категории покупок", callback_data=f"shopping_categories:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Деньги", callback_data=f"money:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Участники списка", callback_data=f"members:{shopping_list.id}")])
     if level == AccessLevel.owner:
@@ -96,7 +91,7 @@ def list_keyboard(
 
 
 def _shopping_category_label(category: ShoppingCategory) -> str:
-    mode = "чек" if category.accounting_mode == "receipt" else "товар"
+    mode = "чек" if category.accounting_mode == "receipt" else "вещи" if category.accounting_mode == "checklist" else "товар"
     if category.scope == "personal":
         owner = _user_label(category.owner) if category.owner is not None else f"ID {category.owner_id}"
         return _short(f"{category.title}: {owner} ({mode})", 48)
@@ -133,19 +128,37 @@ def shopping_category_keyboard(
     user_id: int,
 ) -> InlineKeyboardMarkup:
     can_edit = level == AccessLevel.owner or (category.scope == "personal" and category.owner_id == user_id)
+    add_label = "Добавить вещь" if category.accounting_mode == "checklist" else "Добавить товар"
     rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text="Добавить товар", callback_data=f"add_category:{category.id}")],
+        [InlineKeyboardButton(text=add_label, callback_data=f"add_category:{category.id}")],
     ]
-    if category.accounting_mode == "receipt":
+    if category.accounting_mode != "checklist":
         rows.append([InlineKeyboardButton(text="Чек", callback_data=f"receipt:{category.id}")])
     if can_edit:
-        next_mode = "receipt" if category.accounting_mode == "per_item" else "per_item"
-        next_label = "Считать по чеку" if next_mode == "receipt" else "Считать по товарам"
-        rows.append([InlineKeyboardButton(text=next_label, callback_data=f"shopping_category_mode:{category.id}:{next_mode}")])
+        rows.append([InlineKeyboardButton(text="Настройки", callback_data=f"shopping_category_settings:{category.id}")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=f"shopping_categories:{category.list_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def shopping_category_settings_keyboard(
+    category: ShoppingCategory,
+    level: AccessLevel,
+    user_id: int,
+) -> InlineKeyboardMarkup:
+    can_edit = level == AccessLevel.owner or (category.scope == "personal" and category.owner_id == user_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_edit:
+        mode_buttons = [
+            ("per_item", "Покупки по товарам"),
+            ("receipt", "Покупки по чеку"),
+            ("checklist", "Вещи взять"),
+        ]
+        for mode, label in mode_buttons:
+            mark = "✓ " if category.accounting_mode == mode else ""
+            rows.append([InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"shopping_category_mode:{category.id}:{mode}")])
         rows.append([InlineKeyboardButton(text="Переименовать", callback_data=f"shopping_category_rename:{category.id}")])
         rows.append([InlineKeyboardButton(text="Удалить", callback_data=f"shopping_category_delete:{category.id}")])
-    rows.append([InlineKeyboardButton(text="Назад к категориям", callback_data=f"shopping_categories:{category.list_id}")])
-    rows.append([InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{category.list_id}")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=f"shopping_category:{category.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

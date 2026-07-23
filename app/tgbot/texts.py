@@ -100,11 +100,19 @@ def format_list_text(
 
 
 def _format_shopping_category_heading(category: ShoppingCategory) -> str:
-    mode = "по чеку" if category.accounting_mode == "receipt" else "по товару"
+    mode = _format_shopping_category_mode(category.accounting_mode)
     if category.scope == "personal":
         owner = _format_user_name(category.owner) if category.owner is not None else f"ID {category.owner_id}"
         return f"{escape(category.title)}: {owner} ({mode})"
     return f"{escape(category.title)} ({mode})"
+
+
+def _format_shopping_category_mode(accounting_mode: str) -> str:
+    if accounting_mode == "receipt":
+        return "по чеку"
+    if accounting_mode == "checklist":
+        return "вещи взять"
+    return "по товару"
 
 
 def _format_item_lines(items: Sequence[ShoppingItem]) -> list[str]:
@@ -318,6 +326,16 @@ def format_shopping_category_text(
     else:
         lines.append("В этой категории пока пусто.")
     return "\n".join(lines)
+
+
+def format_shopping_category_settings_text(category: ShoppingCategory) -> str:
+    return "\n".join(
+        [
+            f"<b>Настройки: {_format_shopping_category_heading(category)}</b>",
+            "",
+            f"Режим: {_format_shopping_category_mode(category.accounting_mode)}.",
+        ]
+    )
 
 
 def format_receipt_items_text(
