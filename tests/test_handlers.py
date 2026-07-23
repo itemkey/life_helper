@@ -9,6 +9,7 @@ from app.services import shopping
 from app.tgbot.states import ShoppingListStates
 from app.tgbot.handlers import (
     callback_add_items,
+    callback_add_category_items,
     callback_add_common_items,
     callback_buy_source,
     callback_cancel,
@@ -535,6 +536,35 @@ async def test_add_button_shows_shopping_categories(session):
     assert "Выбери категорию списка" in query_message.edits[-1][0]
     buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
     assert any(button.callback_data.startswith("add_category:") for button in buttons)
+
+
+async def test_add_category_item_returns_to_same_category_screen(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=shopping_list.id)
+    category = next(item for item in categories if item.scope == shopping.ITEM_SCOPE_COMMON)
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+    state = FakeState()
+
+    await callback_add_category_items(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"add_category:{category.id}",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    assert state.data["cancel_return"] == "shopping_category"
+    assert state.data["category_id"] == category.id
+
+    message = FakeMessage(from_user=FakeTelegramUser(id=100), text="Сок")
+    await state_add_items(message, state, FakeBot(), session)
+
+    assert state.cleared is True
+    assert message.answers
+    assert "Сок" in message.answers[-1][0]
+    assert "Пикник" not in message.answers[-1][0]
 
 
 async def test_shopping_category_add_and_receipt_mode_flow(session):

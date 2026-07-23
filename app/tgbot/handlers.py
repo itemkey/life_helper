@@ -1051,7 +1051,10 @@ async def state_add_items(message: Message, state: FSMContext, bot: Bot, session
         )
         await session.commit()
         await state.clear()
-        await _show_list(message, session, user_id, list_id)
+        if category_id is not None and data.get("cancel_return") == "shopping_category":
+            await _show_shopping_category(message, session, user_id, category_id)
+        else:
+            await _show_list(message, session, user_id, list_id)
         await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
     except LifeHelperError as error:
         await _handle_service_error(message, error)
