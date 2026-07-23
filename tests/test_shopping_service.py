@@ -325,7 +325,7 @@ async def test_shopping_category_delete_rejects_non_empty_category(session):
     )
     await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Сок", category_id=category.id)
 
-    with pytest.raises(ValidationError, match="Сначала удали товары"):
+    with pytest.raises(ValidationError, match="Сначала удали элементы"):
         await shopping.delete_shopping_category(session, user_id=100, category_id=category.id)
 
 
@@ -549,6 +549,39 @@ async def test_expense_categories_can_be_created_and_assigned_to_expenses(sessio
     assert [(item.title, item.position) for item in summary.categories] == [("Маршрутка", 1)]
     assert [(expense.title, expense.category_id, expense.category.title) for expense in summary.expenses] == [
         ("Маршрутка", category.id, "Маршрутка")
+    ]
+
+
+async def test_expense_category_can_be_deleted_without_deleting_expenses(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    category = await shopping.create_expense_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Маршрутка",
+    )
+    expense = await shopping.create_expense(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Маршрутка",
+        amount="6",
+        source=shopping.EXPENSE_SOURCE_PERSONAL,
+        share_user_ids=[100],
+        category_id=category.id,
+    )
+
+    list_id = await shopping.delete_expense_category(session, user_id=100, category_id=category.id)
+
+    assert list_id == shopping_list.id
+    assert await session.get(ExpenseCategory, category.id) is None
+    await session.refresh(expense)
+    assert expense.category_id is None
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert summary.categories == []
+    assert [(item.title, item.amount, item.category) for item in summary.expenses] == [
+        ("Маршрутка", 600, None)
     ]
 
 

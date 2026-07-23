@@ -81,7 +81,7 @@ def list_keyboard(
         rows.append(row)
 
     rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"refresh:{shopping_list.id}")])
-    rows.append([InlineKeyboardButton(text="Категории покупок", callback_data=f"shopping_categories:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Категории списков", callback_data=f"shopping_categories:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Деньги", callback_data=f"money:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Участники списка", callback_data=f"members:{shopping_list.id}")])
     if level == AccessLevel.owner:
@@ -91,7 +91,12 @@ def list_keyboard(
 
 
 def _shopping_category_label(category: ShoppingCategory) -> str:
-    mode = "чек" if category.accounting_mode == "receipt" else "вещи" if category.accounting_mode == "checklist" else "товар"
+    if category.accounting_mode == "checklist":
+        mode = "список вещей"
+    elif category.accounting_mode == "receipt":
+        mode = "список покупок, чек"
+    else:
+        mode = "список покупок, товары"
     if category.scope == "personal":
         owner = _user_label(category.owner) if category.owner is not None else f"ID {category.owner_id}"
         return _short(f"{category.title}: {owner} ({mode})", 48)
@@ -149,13 +154,31 @@ def shopping_category_settings_keyboard(
     rows: list[list[InlineKeyboardButton]] = []
     if can_edit:
         mode_buttons = [
-            ("per_item", "Покупки по товарам"),
-            ("receipt", "Покупки по чеку"),
-            ("checklist", "Вещи взять"),
+            (
+                "per_item" if category.accounting_mode == "checklist" else category.accounting_mode,
+                "Список покупок",
+                category.accounting_mode != "checklist",
+            ),
+            ("checklist", "Список вещей", category.accounting_mode == "checklist"),
         ]
-        for mode, label in mode_buttons:
-            mark = "✓ " if category.accounting_mode == mode else ""
+        for mode, label, is_selected in mode_buttons:
+            mark = "✓ " if is_selected else ""
             rows.append([InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"shopping_category_mode:{category.id}:{mode}")])
+        if category.accounting_mode != "checklist":
+            accounting_buttons = [
+                ("per_item", "По товарам"),
+                ("receipt", "По чеку"),
+            ]
+            for mode, label in accounting_buttons:
+                mark = "✓ " if category.accounting_mode == mode else ""
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"{mark}{label}",
+                            callback_data=f"shopping_category_mode:{category.id}:{mode}",
+                        )
+                    ]
+                )
         rows.append([InlineKeyboardButton(text="Переименовать", callback_data=f"shopping_category_rename:{category.id}")])
         rows.append([InlineKeyboardButton(text="Удалить", callback_data=f"shopping_category_delete:{category.id}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data=f"shopping_category:{category.id}")])
@@ -170,7 +193,7 @@ def shopping_category_select_keyboard(
         [InlineKeyboardButton(text=_shopping_category_label(category), callback_data=f"add_category:{category.id}")]
         for category in categories
     ]
-    rows.append([InlineKeyboardButton(text="Категории покупок", callback_data=f"shopping_categories:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Категории списков", callback_data=f"shopping_categories:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{shopping_list.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -254,6 +277,7 @@ def expense_category_keyboard(category: ExpenseCategory) -> InlineKeyboardMarkup
             [InlineKeyboardButton(text="Новая трата", callback_data=f"expense_category_add:{category.id}")],
             [InlineKeyboardButton(text="Распределение", callback_data=f"expense_category_split:{category.id}")],
             [InlineKeyboardButton(text="Переименовать", callback_data=f"expense_category_rename:{category.id}")],
+            [InlineKeyboardButton(text="Удалить", callback_data=f"expense_category_delete:{category.id}")],
             [InlineKeyboardButton(text="Назад к категориям", callback_data=f"categories:{category.list_id}")],
             [InlineKeyboardButton(text="Назад к деньгам", callback_data=f"money:{category.list_id}")],
         ]

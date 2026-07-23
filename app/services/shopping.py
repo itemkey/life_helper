@@ -212,7 +212,7 @@ async def _get_participant_users(session: AsyncSession, shopping_list: ShoppingL
 
 def _validate_shopping_category_scope(scope: str) -> None:
     if scope not in {ITEM_SCOPE_COMMON, ITEM_SCOPE_PERSONAL}:
-        raise ValidationError("Не понял, это общая или личная категория покупок.")
+        raise ValidationError("Не понял, это общая или личная категория списка.")
 
 
 def _validate_shopping_category_mode(accounting_mode: str) -> None:
@@ -221,7 +221,7 @@ def _validate_shopping_category_mode(accounting_mode: str) -> None:
         SHOPPING_CATEGORY_MODE_RECEIPT,
         SHOPPING_CATEGORY_MODE_CHECKLIST,
     }:
-        raise ValidationError("Не понял режим расчёта категории покупок.")
+        raise ValidationError("Не понял режим категории списка.")
 
 
 async def _shopping_category_title_exists(
@@ -340,7 +340,7 @@ def _ensure_shopping_category_edit_allowed(
         return
     if category.scope == ITEM_SCOPE_PERSONAL and category.owner_id == user_id:
         return
-    raise AccessDenied("Эту категорию покупок может менять только владелец тусовки или владелец личной категории.")
+    raise AccessDenied("Эту категорию списка может менять только владелец тусовки или владелец личной категории.")
 
 
 def _ensure_shopping_category_add_allowed(
@@ -353,7 +353,7 @@ def _ensure_shopping_category_add_allowed(
         return
     if level == AccessLevel.owner or category.owner_id == user_id:
         return
-    raise AccessDenied("В чужую личную категорию можно смотреть, но нельзя добавлять покупки.")
+    raise AccessDenied("В чужую личную категорию можно смотреть, но нельзя добавлять элементы.")
 
 
 async def get_list_participants(
@@ -470,6 +470,27 @@ async def set_expense_category_default_split(
     return category
 
 
+async def delete_expense_category(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    category_id: int,
+) -> int:
+    shopping_list, category, _ = await get_expense_category(session, user_id=user_id, category_id=category_id)
+    await session.execute(
+        update(Expense)
+        .where(
+            Expense.list_id == shopping_list.id,
+            Expense.category_id == category.id,
+        )
+        .values(category_id=None)
+    )
+    list_id = shopping_list.id
+    await session.delete(category)
+    await session.flush()
+    return list_id
+
+
 async def get_shopping_categories(
     session: AsyncSession,
     *,
@@ -505,7 +526,7 @@ async def get_shopping_category(
         .where(ShoppingCategory.id == category_id)
     )
     if category is None:
-        raise ListNotFound("Категория покупок не найдена.")
+        raise ListNotFound("Категория списка не найдена.")
     shopping_list, level = await require_access(session, user_id=user_id, list_id=category.list_id)
     return shopping_list, category, level
 
@@ -571,7 +592,7 @@ async def create_shopping_category(
         scope=scope,
         owner_id=owner_id,
     ):
-        raise ValidationError("Такая категория покупок уже есть.")
+        raise ValidationError("Такая категория списка уже есть.")
 
     category = ShoppingCategory(
         list_id=shopping_list.id,
@@ -605,7 +626,7 @@ async def rename_shopping_category(
         owner_id=category.owner_id,
         exclude_category_id=category.id,
     ):
-        raise ValidationError("Такая категория покупок уже есть.")
+        raise ValidationError("Такая категория списка уже есть.")
     category.title = normalized_title
     await session.flush()
     return category
@@ -639,7 +660,7 @@ async def delete_shopping_category(
         select(func.count()).select_from(ShoppingItem).where(ShoppingItem.category_id == category.id)
     )
     if int(item_count or 0) > 0:
-        raise ValidationError("Сначала удали товары из этой категории покупок.")
+        raise ValidationError("Сначала удали элементы из этой категории списка.")
 
     if category.scope == ITEM_SCOPE_COMMON:
         category_count = await session.scalar(
@@ -651,7 +672,7 @@ async def delete_shopping_category(
             )
         )
         if int(category_count or 0) <= 1:
-            raise ValidationError("Нельзя удалить последнюю общую категорию покупок.")
+            raise ValidationError("Нельзя удалить последнюю общую категорию списка.")
     else:
         category_count = await session.scalar(
             select(func.count())
@@ -864,7 +885,7 @@ async def add_items(
     if category_id is not None:
         _, category, _ = await get_shopping_category(session, user_id=user_id, category_id=category_id)
         if category.list_id != shopping_list.id:
-            raise ValidationError("Категория покупок должна принадлежать этой тусовке.")
+            raise ValidationError("Категория списка должна принадлежать этой тусовке.")
         _ensure_shopping_category_add_allowed(category=category, user_id=user_id, level=level)
     else:
         await _ensure_default_shopping_categories(session, shopping_list)

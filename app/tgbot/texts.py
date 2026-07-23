@@ -17,7 +17,7 @@ from app.services.shopping import (
 
 WELCOME_TEXT = (
     "Привет. Я Life Helper.\n\n"
-    "Теперь можно вести тусовки: общий список, личные хотелки, категории покупок, чеки, взносы, траты и честный итог по деньгам."
+    "Теперь можно вести тусовки: общий список, личные хотелки, категории списков, чеки, взносы, траты и честный итог по деньгам."
 )
 
 HELP_TEXT = (
@@ -58,7 +58,7 @@ def format_list_text(
         "",
     ]
     if not items:
-        lines.append("Тусовка пока пустая. Добавь продукты в категорию покупок.")
+        lines.append("Тусовка пока пустая. Добавь товары или вещи в категории списков.")
         return "\n".join(lines)
 
     categorized_items: dict[int, list[ShoppingItem]] = {}
@@ -109,10 +109,24 @@ def _format_shopping_category_heading(category: ShoppingCategory) -> str:
 
 def _format_shopping_category_mode(accounting_mode: str) -> str:
     if accounting_mode == "receipt":
-        return "по чеку"
+        return "список покупок, по чеку"
     if accounting_mode == "checklist":
-        return "вещи взять"
-    return "по товару"
+        return "список вещей"
+    return "список покупок, по товарам"
+
+
+def _format_shopping_category_kind(accounting_mode: str) -> str:
+    if accounting_mode == "checklist":
+        return "Список вещей"
+    return "Список покупок"
+
+
+def _format_shopping_category_accounting(accounting_mode: str) -> str | None:
+    if accounting_mode == "receipt":
+        return "по чеку"
+    if accounting_mode == "per_item":
+        return "по товарам"
+    return None
 
 
 def _format_item_lines(items: Sequence[ShoppingItem]) -> list[str]:
@@ -301,11 +315,11 @@ def format_shopping_categories_text(
     categories: Sequence[ShoppingCategory],
 ) -> str:
     lines = [
-        f"<b>Категории покупок: {escape(shopping_list.title)}</b>",
+        f"<b>Категории списков: {escape(shopping_list.title)}</b>",
         "",
     ]
     if not categories:
-        lines.append("Категорий покупок пока нет.")
+        lines.append("Категорий списков пока нет.")
         return "\n".join(lines)
 
     for index, category in enumerate(categories, start=1):
@@ -329,12 +343,16 @@ def format_shopping_category_text(
 
 
 def format_shopping_category_settings_text(category: ShoppingCategory) -> str:
+    lines = [
+        f"<b>Настройки: {_format_shopping_category_heading(category)}</b>",
+        "",
+        f"Тип: {_format_shopping_category_kind(category.accounting_mode)}.",
+    ]
+    accounting = _format_shopping_category_accounting(category.accounting_mode)
+    if accounting is not None:
+        lines.append(f"Расчёт: {accounting}.")
     return "\n".join(
-        [
-            f"<b>Настройки: {_format_shopping_category_heading(category)}</b>",
-            "",
-            f"Режим: {_format_shopping_category_mode(category.accounting_mode)}.",
-        ]
+        lines
     )
 
 

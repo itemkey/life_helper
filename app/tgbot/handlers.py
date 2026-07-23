@@ -713,7 +713,7 @@ async def _start_shopping_category_title(
             cancel_list_id=list_id,
         )
         label = "общей" if scope == shopping.ITEM_SCOPE_COMMON else "личной"
-        await _send_or_edit(query, f"Напиши название {label} категории покупок.", reply_markup=cancel_keyboard())
+        await _send_or_edit(query, f"Напиши название {label} категории списка.", reply_markup=cancel_keyboard())
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -780,7 +780,7 @@ async def callback_shopping_category_rename(query: CallbackQuery, state: FSMCont
             cancel_list_id=shopping_list.id,
             cancel_category_id=category.id,
         )
-        await _send_or_edit(query, "Напиши новое название категории покупок.", reply_markup=cancel_keyboard())
+        await _send_or_edit(query, "Напиши новое название категории списка.", reply_markup=cancel_keyboard())
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -990,7 +990,7 @@ async def callback_add_items(query: CallbackQuery, state: FSMContext, session: A
             return
         await _send_or_edit(
             query,
-            "Выбери категорию покупок.",
+            "Выбери категорию списка.",
             reply_markup=shopping_category_select_keyboard(shopping_list, visible_categories),
         )
     except LifeHelperError as error:
@@ -1495,6 +1495,20 @@ async def callback_expense_category_set_split(query: CallbackQuery, session: Asy
             default_split=parts[1],
         )
         await _show_expense_category(query, session, user_id, category.id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_category_delete:"))
+async def callback_expense_category_delete(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    category_id = _parse_id(query.data, "expense_category_delete:")
+    if category_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id = await shopping.delete_expense_category(session, user_id=user_id, category_id=category_id)
+        await _show_categories(query, session, user_id, list_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 

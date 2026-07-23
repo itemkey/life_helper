@@ -18,6 +18,7 @@ from app.tgbot.handlers import (
     callback_check_all_items,
     callback_expense_category,
     callback_expense_category_add,
+    callback_expense_category_delete,
     callback_expense_category_set_split,
     callback_expense_source,
     callback_expense_selected_done,
@@ -531,7 +532,7 @@ async def test_add_button_shows_shopping_categories(session):
     )
 
     assert query_message.edits
-    assert "Выбери категорию покупок" in query_message.edits[-1][0]
+    assert "Выбери категорию списка" in query_message.edits[-1][0]
     buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
     assert any(button.callback_data.startswith("add_category:") for button in buttons)
 
@@ -787,6 +788,31 @@ async def test_contribution_and_category_expense_flow_updates_money_summary(sess
         ("Маршрутка", "Маршрутка", 3000, shopping.EXPENSE_SOURCE_CASHBOX)
     ]
     assert {balance.user.id: balance.balance for balance in summary.balances} == {100: 10000, 200: -3000}
+
+
+async def test_expense_category_delete_handler_removes_category(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    category = await shopping.create_expense_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Маршрутка",
+    )
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_expense_category_delete(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"expense_category_delete:{category.id}",
+            message=query_message,
+        ),
+        session,
+    )
+
+    assert query_message.edits
+    assert "Маршрутка" not in query_message.edits[-1][0]
+    assert await session.get(type(category), category.id) is None
 
 
 async def test_expense_category_default_all_flow_has_fast_default_button(session):
