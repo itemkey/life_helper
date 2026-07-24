@@ -31,6 +31,8 @@ from app.tgbot.keyboards import (
     members_keyboard,
     members_management_keyboard,
     money_keyboard,
+    payer_choice_keyboard,
+    payer_participants_keyboard,
     receipt_cancel_keyboard,
     receipt_items_keyboard,
     settings_keyboard,
@@ -1137,21 +1139,155 @@ async def state_buying_item_amount(message: Message, state: FSMContext, session:
 async def callback_buy_source(query: CallbackQuery, state: FSMContext, bot: Bot, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, query.from_user)
     source = (query.data or "").removeprefix("buy_source:")
+    if source not in {shopping.EXPENSE_SOURCE_CASHBOX, shopping.EXPENSE_SOURCE_PERSONAL}:
+        await _answer_callback(query, "Не понял источник оплаты.", show_alert=True)
+        return
+
     data = await state.get_data()
-    item_id = int(data.get("item_id", 0))
-    amount = int(data.get("amount", 0))
     try:
-        list_id = await shopping.record_item_purchase(
+        await state.update_data(source=source, payer_id=None)
+        if source == shopping.EXPENSE_SOURCE_PERSONAL:
+            list_id = int(data.get("list_id", 0))
+            _, participants, _ = await shopping.get_list_participants(
+                session,
+                user_id=user_id,
+                list_id=list_id,
+            )
+            await state.set_state(ShoppingListStates.choosing_item_purchase_payer)
+            await _send_or_edit(
+                query,
+                "Из чьего кармана оплатили?",
+                reply_markup=payer_choice_keyboard(
+                    callback_prefix="buy_payer",
+                    has_other_participants=any(participant.id != user_id for participant in participants),
+                ),
+            )
+            return
+
+        await _record_item_purchase_from_state(
+            query,
+            state,
+            bot,
             session,
             user_id=user_id,
-            item_id=item_id,
-            amount=amount,
+            payer_id=None,
             source=source,
         )
-        await session.commit()
-        await state.clear()
-        await _show_list(query, session, user_id, list_id)
-        await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+async def _record_item_purchase_from_state(
+    query: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    user_id: int,
+    payer_id: int | None,
+    source: str,
+) -> None:
+    data = await state.get_data()
+    await state.update_data(payer_id=payer_id)
+    list_id = await shopping.record_item_purchase(
+        session,
+        user_id=user_id,
+        item_id=int(data.get("item_id", 0)),
+        amount=int(data.get("amount", 0)),
+        source=source,
+        payer_id=payer_id,
+    )
+    await session.commit()
+    await state.clear()
+    await _show_list(query, session, user_id, list_id)
+    await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
+
+
+@router.callback_query(F.data == "buy_payer:self")
+async def callback_buy_payer_self(
+    query: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    data = await state.get_data()
+    if data.get("source") != shopping.EXPENSE_SOURCE_PERSONAL:
+        await _answer_callback(query, "Сначала выбери источник оплаты.", show_alert=True)
+        return
+    try:
+        await _record_item_purchase_from_state(
+            query,
+            state,
+            bot,
+            session,
+            user_id=user_id,
+            payer_id=user_id,
+            source=shopping.EXPENSE_SOURCE_PERSONAL,
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data == "buy_payer:other")
+async def callback_buy_payer_other(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    data = await state.get_data()
+    if data.get("source") != shopping.EXPENSE_SOURCE_PERSONAL:
+        await _answer_callback(query, "Сначала выбери источник оплаты.", show_alert=True)
+        return
+    try:
+        _, participants, _ = await shopping.get_list_participants(
+            session,
+            user_id=user_id,
+            list_id=int(data.get("list_id", 0)),
+        )
+        if not any(participant.id != user_id for participant in participants):
+            await _answer_callback(query, "В тусовке пока нет других участников.", show_alert=True)
+            return
+        await _send_or_edit(
+            query,
+            "Чей карман?",
+            reply_markup=payer_participants_keyboard(
+                participants,
+                current_user_id=user_id,
+                callback_prefix="buy_payer_select",
+            ),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("buy_payer_select:"))
+async def callback_buy_payer_select(
+    query: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    payer_id = _parse_id(query.data, "buy_payer_select:")
+    if payer_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    data = await state.get_data()
+    if data.get("source") != shopping.EXPENSE_SOURCE_PERSONAL:
+        await _answer_callback(query, "Сначала выбери источник оплаты.", show_alert=True)
+        return
+    try:
+        await _record_item_purchase_from_state(
+            query,
+            state,
+            bot,
+            session,
+            user_id=user_id,
+            payer_id=payer_id,
+            source=shopping.EXPENSE_SOURCE_PERSONAL,
+        )
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -1631,23 +1767,56 @@ async def state_expense_amount(message: Message, state: FSMContext, session: Asy
 async def callback_expense_source(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, query.from_user)
     source = (query.data or "").removeprefix("expense_source:")
+    if source not in {shopping.EXPENSE_SOURCE_CASHBOX, shopping.EXPENSE_SOURCE_PERSONAL}:
+        await _answer_callback(query, "Не понял источник оплаты.", show_alert=True)
+        return
+
+    try:
+        await state.update_data(source=source, payer_id=None)
+        if source == shopping.EXPENSE_SOURCE_PERSONAL:
+            data = await state.get_data()
+            list_id = int(data.get("list_id", 0))
+            _, participants, _ = await shopping.get_list_participants(
+                session,
+                user_id=user_id,
+                list_id=list_id,
+            )
+            await state.set_state(ShoppingListStates.choosing_expense_payer)
+            await _send_or_edit(
+                query,
+                "Из чьего кармана оплатили?",
+                reply_markup=payer_choice_keyboard(
+                    callback_prefix="expense_payer",
+                    has_other_participants=any(participant.id != user_id for participant in participants),
+                ),
+            )
+            return
+
+        await _show_expense_split_choice(query, state, session, user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+async def _show_expense_split_choice(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    *,
+    user_id: int,
+) -> None:
     data = await state.get_data()
-    await state.update_data(source=source)
     list_id = int(data.get("list_id", 0))
     default_split = str(data.get("expense_category_default_split") or "")
 
     if default_split == shopping.EXPENSE_SPLIT_SELECTED:
-        try:
-            _, participants, _ = await shopping.get_list_participants(session, user_id=user_id, list_id=list_id)
-            await state.set_state(ShoppingListStates.choosing_expense_split)
-            await state.update_data(selected_user_ids=[user_id])
-            await _send_or_edit(
-                query,
-                "Кто участвует?",
-                reply_markup=expense_participants_keyboard(participants, [user_id]),
-            )
-        except LifeHelperError as error:
-            await _handle_service_error(query, error)
+        _, participants, _ = await shopping.get_list_participants(session, user_id=user_id, list_id=list_id)
+        await state.set_state(ShoppingListStates.choosing_expense_split)
+        await state.update_data(selected_user_ids=[user_id])
+        await _send_or_edit(
+            query,
+            "Кто участвует?",
+            reply_markup=expense_participants_keyboard(participants, [user_id]),
+        )
         return
 
     await state.set_state(ShoppingListStates.choosing_expense_split)
@@ -1665,6 +1834,88 @@ async def callback_expense_source(query: CallbackQuery, state: FSMContext, sessi
     )
 
 
+@router.callback_query(F.data == "expense_payer:self")
+async def callback_expense_payer_self(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    data = await state.get_data()
+    if data.get("source") != shopping.EXPENSE_SOURCE_PERSONAL:
+        await _answer_callback(query, "Сначала выбери источник оплаты.", show_alert=True)
+        return
+    try:
+        await state.update_data(payer_id=user_id)
+        await _show_expense_split_choice(query, state, session, user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data == "expense_payer:other")
+async def callback_expense_payer_other(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    data = await state.get_data()
+    if data.get("source") != shopping.EXPENSE_SOURCE_PERSONAL:
+        await _answer_callback(query, "Сначала выбери источник оплаты.", show_alert=True)
+        return
+    try:
+        _, participants, _ = await shopping.get_list_participants(
+            session,
+            user_id=user_id,
+            list_id=int(data.get("list_id", 0)),
+        )
+        if not any(participant.id != user_id for participant in participants):
+            await _answer_callback(query, "В тусовке пока нет других участников.", show_alert=True)
+            return
+        await _send_or_edit(
+            query,
+            "Чей карман?",
+            reply_markup=payer_participants_keyboard(
+                participants,
+                current_user_id=user_id,
+                callback_prefix="expense_payer_select",
+            ),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_payer_select:"))
+async def callback_expense_payer_select(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    payer_id = _parse_id(query.data, "expense_payer_select:")
+    if payer_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    data = await state.get_data()
+    if data.get("source") != shopping.EXPENSE_SOURCE_PERSONAL:
+        await _answer_callback(query, "Сначала выбери источник оплаты.", show_alert=True)
+        return
+    try:
+        _, participants, _ = await shopping.get_list_participants(
+            session,
+            user_id=user_id,
+            list_id=int(data.get("list_id", 0)),
+        )
+        participant_ids = {participant.id for participant in participants}
+        if payer_id == user_id or payer_id not in participant_ids:
+            await _answer_callback(query, "Можно выбрать только другого участника тусовки.", show_alert=True)
+            return
+        await state.update_data(payer_id=payer_id)
+        await _show_expense_split_choice(query, state, session, user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
 async def _create_expense_from_state(
     target: Message | CallbackQuery,
     state: FSMContext,
@@ -1676,6 +1927,8 @@ async def _create_expense_from_state(
 ) -> None:
     data = await state.get_data()
     list_id = int(data.get("list_id", 0))
+    raw_payer_id = data.get("payer_id")
+    payer_id = int(raw_payer_id) if raw_payer_id is not None else None
     raw_receipt_category_id = data.get("receipt_category_id")
     if raw_receipt_category_id is not None:
         receipt_share_user_ids = share_user_ids
@@ -1690,6 +1943,7 @@ async def _create_expense_from_state(
             amount=int(data.get("amount", 0)),
             source=str(data.get("source", "")),
             share_user_ids=receipt_share_user_ids,
+            payer_id=payer_id,
         )
         await state.clear()
         await _show_list(target, session, user_id, list_id)
@@ -1715,6 +1969,7 @@ async def _create_expense_from_state(
         amount=amount,
         source=source,
         share_user_ids=share_user_ids,
+        payer_id=payer_id,
         category_id=category_id,
     )
     await state.clear()

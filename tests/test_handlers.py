@@ -7,10 +7,14 @@ from aiogram.filters import CommandObject
 from app.db.models import ListViewMessage
 from app.services import shopping
 from app.tgbot.states import ShoppingListStates
+from app.tgbot.texts import format_money_text
 from app.tgbot.handlers import (
     callback_add_items,
     callback_add_category_items,
     callback_add_common_items,
+    callback_buy_payer_other,
+    callback_buy_payer_select,
+    callback_buy_payer_self,
     callback_buy_source,
     callback_cancel,
     callback_category_add,
@@ -21,6 +25,9 @@ from app.tgbot.handlers import (
     callback_expense_category_add,
     callback_expense_category_delete,
     callback_expense_category_set_split,
+    callback_expense_payer_other,
+    callback_expense_payer_select,
+    callback_expense_payer_self,
     callback_expense_source,
     callback_expense_selected_done,
     callback_expense_select,
@@ -339,6 +346,18 @@ async def test_toggle_and_delete_broadcast_public_list_updates_to_other_viewers(
         bot,
         session,
     )
+    assert state.data["state"] == ShoppingListStates.choosing_item_purchase_payer
+
+    await callback_buy_payer_self(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200),
+            data="buy_payer:self",
+            message=FakeEditableMessage(chat=FakeChat(2000), message_id=22),
+        ),
+        state,
+        bot,
+        session,
+    )
 
     assert len(bot.edits) == 1
     assert "Молоко" in str(bot.edits[0]["text"])
@@ -359,6 +378,92 @@ async def test_toggle_and_delete_broadcast_public_list_updates_to_other_viewers(
 
     assert len(bot.edits) == 1
     assert "Тусовка пока пустая" in str(bot.edits[0]["text"])
+
+
+async def test_member_can_choose_personal_item_owner_as_payer(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="artem", first_name="Артём"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="ben", first_name="Бен"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    item = (
+        await shopping.add_items(
+            session,
+            user_id=100,
+            list_id=shopping_list.id,
+            text="2 энергетика Burn классических",
+            scope=shopping.ITEM_SCOPE_PERSONAL,
+        )
+    )[0]
+    state = FakeState()
+    bot = FakeBot()
+
+    await callback_toggle_item(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, username="ben", first_name="Бен"),
+            data=f"toggle:{item.id}",
+            message=FakeEditableMessage(chat=FakeChat(2000), message_id=20),
+        ),
+        bot,
+        session,
+        state=state,
+    )
+    await state_buying_item_amount(
+        FakeMessage(from_user=FakeTelegramUser(id=200, username="ben", first_name="Бен"), text="8"),
+        state,
+        session,
+    )
+    payer_message = FakeEditableMessage(chat=FakeChat(2000), message_id=21)
+    await callback_buy_source(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, username="ben", first_name="Бен"),
+            data="buy_source:personal",
+            message=payer_message,
+        ),
+        state,
+        bot,
+        session,
+    )
+
+    choice_buttons = [button for row in payer_message.reply_markup.inline_keyboard for button in row]
+    assert any(button.text == "Из моего кармана" for button in choice_buttons)
+    assert any(button.text == "Из чужого кармана" for button in choice_buttons)
+
+    await callback_buy_payer_other(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, username="ben", first_name="Бен"),
+            data="buy_payer:other",
+            message=payer_message,
+        ),
+        state,
+        session,
+    )
+    participant_buttons = [button for row in payer_message.reply_markup.inline_keyboard for button in row]
+    assert any(
+        button.text == "Артём (@artem)" and button.callback_data == "buy_payer_select:100"
+        for button in participant_buttons
+    )
+    assert not any(button.callback_data == "buy_payer_select:200" for button in participant_buttons)
+
+    await callback_buy_payer_select(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, username="ben", first_name="Бен"),
+            data="buy_payer_select:100",
+            message=payer_message,
+        ),
+        state,
+        bot,
+        session,
+    )
+
+    summary = await shopping.get_money_summary(session, user_id=200, list_id=shopping_list.id)
+    expense = summary.expenses[0]
+    assert (expense.payer_id, expense.created_by_id) == (100, 200)
+    assert [(share.user_id, share.amount) for share in expense.shares] == [(100, 800)]
+    assert (
+        "2 энергетика Burn классических: 8.00 BYN "
+        "(из своих, платил Артём (@artem), долей: 1)"
+    ) in format_money_text(summary)
 
 
 async def test_toggle_checklist_item_marks_done_without_price_flow(session):
@@ -718,6 +823,26 @@ async def test_receipt_handler_flow_records_one_expense_for_selected_items(sessi
         state,
         session,
     )
+    assert state.data["state"] == ShoppingListStates.choosing_expense_payer
+
+    await callback_expense_payer_other(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data="expense_payer:other",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    await callback_expense_payer_select(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data="expense_payer_select:200",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
     buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
     assert any(button.callback_data == "expense_split:default" for button in buttons)
 
@@ -733,6 +858,7 @@ async def test_receipt_handler_flow_records_one_expense_for_selected_items(sessi
 
     summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
     assert [(expense.title, expense.amount) for expense in summary.expenses] == [("Чек: Общее", 1000)]
+    assert [(expense.payer_id, expense.created_by_id) for expense in summary.expenses] == [(200, 100)]
     assert [item.is_done for item in items] == [True, False]
 
 
@@ -885,6 +1011,16 @@ async def test_expense_category_default_all_flow_has_fast_default_button(session
         FakeCallback(
             from_user=FakeTelegramUser(id=100),
             data="expense_source:personal",
+            message=source_message,
+        ),
+        state,
+        session,
+    )
+    assert state.data["state"] == ShoppingListStates.choosing_expense_payer
+    await callback_expense_payer_self(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data="expense_payer:self",
             message=source_message,
         ),
         state,

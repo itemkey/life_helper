@@ -1079,10 +1079,10 @@ async def create_expense(
 ) -> Expense:
     shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
     payer_id = payer_id or user_id
-    if payer_id != user_id and level != AccessLevel.owner:
-        raise AccessDenied("Записать оплату за другого участника может только владелец тусовки.")
     if source not in {EXPENSE_SOURCE_CASHBOX, EXPENSE_SOURCE_PERSONAL}:
         raise ValidationError("Не понял источник оплаты.")
+    if payer_id != user_id and source != EXPENSE_SOURCE_PERSONAL and level != AccessLevel.owner:
+        raise AccessDenied("Записать оплату за другого участника может только владелец тусовки.")
 
     participant_ids = await _participant_user_ids(session, shopping_list)
     if payer_id not in participant_ids:
@@ -1139,6 +1139,7 @@ async def record_item_purchase(
     item_id: int,
     amount: str | int,
     source: str,
+    payer_id: int | None = None,
 ) -> int:
     _, item, _ = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
     if item.is_done:
@@ -1162,7 +1163,7 @@ async def record_item_purchase(
         amount=amount,
         source=source,
         share_user_ids=share_user_ids,
-        payer_id=user_id,
+        payer_id=payer_id,
         item_id=item.id,
     )
     item.is_done = True
@@ -1189,6 +1190,7 @@ async def record_receipt_purchase(
     amount: str | int,
     source: str,
     share_user_ids: Sequence[int] | None = None,
+    payer_id: int | None = None,
 ) -> int:
     shopping_list, category, _ = await get_shopping_category(session, user_id=user_id, category_id=category_id)
     if category.accounting_mode != SHOPPING_CATEGORY_MODE_RECEIPT:
@@ -1227,7 +1229,7 @@ async def record_receipt_purchase(
         amount=amount,
         source=source,
         share_user_ids=default_share_user_ids,
-        payer_id=user_id,
+        payer_id=payer_id,
         item_ids=[item.id for item in items],
     )
     for item in items:

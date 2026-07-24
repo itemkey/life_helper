@@ -410,6 +410,7 @@ async def test_receipt_purchase_links_multiple_items_and_can_be_cancelled(sessio
         item_ids=[item.id for item in items],
         amount="10.01",
         source=shopping.EXPENSE_SOURCE_PERSONAL,
+        payer_id=200,
     )
 
     assert list_id == shopping_list.id
@@ -422,6 +423,7 @@ async def test_receipt_purchase_links_multiple_items_and_can_be_cancelled(sessio
     assert [(expense.title, expense.amount, expense.item_id) for expense in summary.expenses] == [
         ("Чек: Общее", 1001, None)
     ]
+    assert [(expense.payer_id, expense.created_by_id) for expense in summary.expenses] == [(200, 100)]
     assert [
         (share.user_id, share.amount)
         for expense in summary.expenses
@@ -484,6 +486,55 @@ async def test_item_purchase_creates_default_common_and_personal_expense_shares(
         for share in expense.shares
     ] == [(100, 501), (200, 500), (200, 500)]
     assert {balance.user.id: balance.balance for balance in summary.balances} == {100: 500, 200: -1000}
+
+
+async def test_member_can_pay_for_another_users_personal_item_from_that_users_pocket(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, username="artem", first_name="Артём"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, username="ben", first_name="Бен"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=300, username="outsider", first_name="Чужой"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    personal_item = (
+        await shopping.add_items(
+            session,
+            user_id=100,
+            list_id=shopping_list.id,
+            text="Энергетик",
+            scope=shopping.ITEM_SCOPE_PERSONAL,
+        )
+    )[0]
+
+    await shopping.record_item_purchase(
+        session,
+        user_id=200,
+        item_id=personal_item.id,
+        amount="8",
+        source=shopping.EXPENSE_SOURCE_PERSONAL,
+        payer_id=100,
+    )
+
+    summary = await shopping.get_money_summary(session, user_id=200, list_id=shopping_list.id)
+    expense = summary.expenses[0]
+    assert (expense.payer_id, expense.created_by_id, expense.source) == (
+        100,
+        200,
+        shopping.EXPENSE_SOURCE_PERSONAL,
+    )
+    assert [(share.user_id, share.amount) for share in expense.shares] == [(100, 800)]
+    assert {balance.user.id: balance.balance for balance in summary.balances} == {100: 0, 200: 0}
+
+    with pytest.raises(ValidationError, match="участником тусовки"):
+        await shopping.create_expense(
+            session,
+            user_id=200,
+            list_id=shopping_list.id,
+            title="Поддельная трата",
+            amount="1",
+            source=shopping.EXPENSE_SOURCE_PERSONAL,
+            payer_id=300,
+            share_user_ids=[200],
+        )
 
 
 async def test_money_summary_tracks_contributions_sources_and_settlements(session):

@@ -6,11 +6,15 @@ from app.tgbot.keyboards import (
     expense_categories_keyboard,
     expense_category_keyboard,
     expense_category_split_keyboard,
+    expense_source_keyboard,
     expense_split_keyboard,
+    item_purchase_source_keyboard,
     list_keyboard,
     members_keyboard,
     members_management_keyboard,
     money_keyboard,
+    payer_choice_keyboard,
+    payer_participants_keyboard,
     receipt_items_keyboard,
     shopping_categories_keyboard,
     shopping_category_keyboard,
@@ -60,6 +64,66 @@ def test_money_keyboard_has_party_money_actions():
     assert any(button.text == "Трата" and button.callback_data == "expense:1" for button in buttons)
     assert any(button.text == "Категории трат" and button.callback_data == "categories:1" for button in buttons)
     assert any(button.text == "Итог" and button.callback_data == "money_final:1" for button in buttons)
+
+
+def test_payment_source_and_payer_keyboards():
+    item_source_buttons = [
+        button
+        for row in item_purchase_source_keyboard().inline_keyboard
+        for button in row
+    ]
+    expense_source_buttons = [
+        button
+        for row in expense_source_keyboard().inline_keyboard
+        for button in row
+    ]
+
+    assert any(button.text == "Из кармана" and button.callback_data == "buy_source:personal" for button in item_source_buttons)
+    assert any(
+        button.text == "Из кармана" and button.callback_data == "expense_source:personal"
+        for button in expense_source_buttons
+    )
+    assert not any(button.text == "Из своих" for button in item_source_buttons + expense_source_buttons)
+
+    choice_buttons = [
+        button
+        for row in payer_choice_keyboard(
+            callback_prefix="buy_payer",
+            has_other_participants=True,
+        ).inline_keyboard
+        for button in row
+    ]
+    assert any(button.text == "Из моего кармана" and button.callback_data == "buy_payer:self" for button in choice_buttons)
+    assert any(button.text == "Из чужого кармана" and button.callback_data == "buy_payer:other" for button in choice_buttons)
+
+    single_user_buttons = [
+        button
+        for row in payer_choice_keyboard(
+            callback_prefix="buy_payer",
+            has_other_participants=False,
+        ).inline_keyboard
+        for button in row
+    ]
+    assert not any(button.text == "Из чужого кармана" for button in single_user_buttons)
+
+    participants = [
+        User(id=100, username="artem", first_name="Артём"),
+        User(id=200, username="ben", first_name="Бен"),
+    ]
+    participant_buttons = [
+        button
+        for row in payer_participants_keyboard(
+            participants,
+            current_user_id=200,
+            callback_prefix="buy_payer_select",
+        ).inline_keyboard
+        for button in row
+    ]
+    assert any(
+        button.text == "Артём (@artem)" and button.callback_data == "buy_payer_select:100"
+        for button in participant_buttons
+    )
+    assert not any(button.callback_data == "buy_payer_select:200" for button in participant_buttons)
 
 
 def test_expense_categories_keyboard_has_category_custom_and_add_actions():

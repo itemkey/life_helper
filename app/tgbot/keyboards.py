@@ -228,11 +228,41 @@ def item_purchase_source_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="Из кассы", callback_data="buy_source:cashbox"),
-                InlineKeyboardButton(text="Из своих", callback_data="buy_source:personal"),
+                InlineKeyboardButton(text="Из кармана", callback_data="buy_source:personal"),
             ],
             [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
         ]
     )
+
+
+def payer_choice_keyboard(*, callback_prefix: str, has_other_participants: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Из моего кармана", callback_data=f"{callback_prefix}:self")],
+    ]
+    if has_other_participants:
+        rows.append([InlineKeyboardButton(text="Из чужого кармана", callback_data=f"{callback_prefix}:other")])
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payer_participants_keyboard(
+    participants: Sequence[User],
+    *,
+    current_user_id: int,
+    callback_prefix: str,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_user_label(user),
+                callback_data=f"{callback_prefix}:{user.id}",
+            )
+        ]
+        for user in participants
+        if user.id != current_user_id
+    ]
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def money_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
@@ -305,7 +335,7 @@ def expense_source_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="Из кассы", callback_data="expense_source:cashbox"),
-                InlineKeyboardButton(text="Из своих", callback_data="expense_source:personal"),
+                InlineKeyboardButton(text="Из кармана", callback_data="expense_source:personal"),
             ],
             [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
         ]
