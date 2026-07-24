@@ -955,6 +955,16 @@ async def test_expense_category_delete_handler_removes_category(session):
         list_id=shopping_list.id,
         title="Маршрутка",
     )
+    expense = await shopping.create_expense(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Маршрутка",
+        amount="12",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[100],
+        category_id=category.id,
+    )
     query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
 
     await callback_expense_category_delete(
@@ -969,6 +979,10 @@ async def test_expense_category_delete_handler_removes_category(session):
     assert query_message.edits
     assert "Маршрутка" not in query_message.edits[-1][0]
     assert await session.get(type(category), category.id) is None
+    assert await session.get(type(expense), expense.id) is None
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert summary.expenses == []
+    assert summary.cashbox_balance == 0
 
 
 async def test_expense_category_default_all_flow_has_fast_default_button(session):

@@ -603,37 +603,72 @@ async def test_expense_categories_can_be_created_and_assigned_to_expenses(sessio
     ]
 
 
-async def test_expense_category_can_be_deleted_without_deleting_expenses(session):
+async def test_expense_category_deletion_removes_only_its_expenses_and_shares(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
-    category = await shopping.create_expense_category(
+    transport_category = await shopping.create_expense_category(
         session,
         user_id=100,
         list_id=shopping_list.id,
         title="Маршрутка",
     )
-    expense = await shopping.create_expense(
+    food_category = await shopping.create_expense_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Еда",
+    )
+    transport_expense = await shopping.create_expense(
         session,
         user_id=100,
         list_id=shopping_list.id,
         title="Маршрутка",
-        amount="6",
+        amount="12",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[100],
+        category_id=transport_category.id,
+    )
+    food_expense = await shopping.create_expense(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Пицца",
+        amount="20",
         source=shopping.EXPENSE_SOURCE_PERSONAL,
         share_user_ids=[100],
-        category_id=category.id,
+        category_id=food_category.id,
+    )
+    custom_expense = await shopping.create_expense(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Разовая трата",
+        amount="3",
+        source=shopping.EXPENSE_SOURCE_PERSONAL,
+        share_user_ids=[100],
     )
 
-    list_id = await shopping.delete_expense_category(session, user_id=100, category_id=category.id)
+    list_id = await shopping.delete_expense_category(
+        session,
+        user_id=100,
+        category_id=transport_category.id,
+    )
 
     assert list_id == shopping_list.id
-    assert await session.get(ExpenseCategory, category.id) is None
-    await session.refresh(expense)
-    assert expense.category_id is None
+    assert await session.get(ExpenseCategory, transport_category.id) is None
+    assert await session.get(Expense, transport_expense.id) is None
+    assert await session.scalar(
+        select(ExpenseShare).where(ExpenseShare.expense_id == transport_expense.id)
+    ) is None
     summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
-    assert summary.categories == []
-    assert [(item.title, item.amount, item.category) for item in summary.expenses] == [
-        ("Маршрутка", 600, None)
+    assert [(category.title, category.id) for category in summary.categories] == [
+        ("Еда", food_category.id)
     ]
+    assert [(expense.id, expense.title, expense.category_id) for expense in summary.expenses] == [
+        (food_expense.id, "Пицца", food_category.id),
+        (custom_expense.id, "Разовая трата", None),
+    ]
+    assert summary.cashbox_balance == 0
 
 
 async def test_expense_category_default_split_can_be_changed(session):

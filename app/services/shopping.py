@@ -477,13 +477,21 @@ async def delete_expense_category(
     category_id: int,
 ) -> int:
     shopping_list, category, _ = await get_expense_category(session, user_id=user_id, category_id=category_id)
+    category_expense_ids = select(Expense.id).where(
+        Expense.list_id == shopping_list.id,
+        Expense.category_id == category.id,
+    )
     await session.execute(
-        update(Expense)
-        .where(
+        delete(ExpenseShare).where(ExpenseShare.expense_id.in_(category_expense_ids))
+    )
+    await session.execute(
+        delete(ExpenseItem).where(ExpenseItem.expense_id.in_(category_expense_ids))
+    )
+    await session.execute(
+        delete(Expense).where(
             Expense.list_id == shopping_list.id,
             Expense.category_id == category.id,
         )
-        .values(category_id=None)
     )
     list_id = shopping_list.id
     await session.delete(category)
