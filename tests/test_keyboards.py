@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from app.db.models import ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
+from app.db.models import Expense, ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
 from app.services.access import AccessLevel
 from app.tgbot.keyboards import (
     expense_categories_keyboard,
     expense_category_keyboard,
     expense_category_split_keyboard,
+    expense_delete_confirm_keyboard,
+    expense_deletion_keyboard,
     expense_source_keyboard,
     expense_split_keyboard,
     item_purchase_source_keyboard,
@@ -57,13 +59,44 @@ def test_list_keyboard_has_categories_and_money_buttons():
 def test_money_keyboard_has_party_money_actions():
     shopping_list = ShoppingList(id=1, owner_id=100, title="Дом")
 
-    keyboard = money_keyboard(shopping_list)
+    keyboard = money_keyboard(shopping_list, has_expenses=True)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
     assert any(button.text == "Взнос" and button.callback_data == "contribution:1" for button in buttons)
     assert any(button.text == "Трата" and button.callback_data == "expense:1" for button in buttons)
     assert any(button.text == "Категории трат" and button.callback_data == "categories:1" for button in buttons)
     assert any(button.text == "Итог" and button.callback_data == "money_final:1" for button in buttons)
+    assert any(button.text == "Удалить трату" and button.callback_data == "expense_delete_list:1" for button in buttons)
+
+
+def test_expense_deletion_keyboard_paginates_and_confirms():
+    shopping_list = ShoppingList(id=1, owner_id=100, title="Дом", currency="BYN")
+    expenses = [
+        Expense(
+            id=index,
+            list_id=1,
+            title=f"Трата {index}",
+            amount=index * 100,
+            payer_id=100,
+            source="cashbox",
+        )
+        for index in range(1, 10)
+    ]
+
+    first_page = expense_deletion_keyboard(shopping_list, expenses, page=0)
+    first_page_buttons = [button for row in first_page.inline_keyboard for button in row]
+    assert sum(button.callback_data.startswith("expense_delete_confirm:") for button in first_page_buttons) == 8
+    assert any(button.callback_data == "expense_delete_page:1:1" for button in first_page_buttons)
+
+    second_page = expense_deletion_keyboard(shopping_list, expenses, page=1)
+    second_page_buttons = [button for row in second_page.inline_keyboard for button in row]
+    assert sum(button.callback_data.startswith("expense_delete_confirm:") for button in second_page_buttons) == 1
+    assert any(button.callback_data == "expense_delete_page:1:0" for button in second_page_buttons)
+
+    confirmation = expense_delete_confirm_keyboard(expense_id=9, list_id=1, page=1)
+    confirmation_buttons = [button for row in confirmation.inline_keyboard for button in row]
+    assert any(button.text == "Да, удалить" and button.callback_data == "expense_delete_apply:9:1" for button in confirmation_buttons)
+    assert any(button.text == "Нет, назад" and button.callback_data == "expense_delete_page:1:1" for button in confirmation_buttons)
 
 
 def test_payment_source_and_payer_keyboards():

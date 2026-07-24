@@ -499,6 +499,44 @@ async def delete_expense_category(
     return list_id
 
 
+async def get_expense(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+) -> tuple[ShoppingList, Expense]:
+    expense = await session.scalar(
+        select(Expense)
+        .options(
+            selectinload(Expense.category),
+            selectinload(Expense.item),
+            selectinload(Expense.item_links).selectinload(ExpenseItem.item),
+            selectinload(Expense.shares),
+        )
+        .where(Expense.id == expense_id)
+    )
+    if expense is None:
+        raise ValidationError("Трата не найдена.")
+    shopping_list, _ = await require_access(session, user_id=user_id, list_id=expense.list_id)
+    return shopping_list, expense
+
+
+async def delete_expense(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+) -> int:
+    shopping_list, expense = await get_expense(session, user_id=user_id, expense_id=expense_id)
+    if expense.item is not None:
+        expense.item.is_done = False
+    for item_link in expense.item_links:
+        item_link.item.is_done = False
+    await session.delete(expense)
+    await session.flush()
+    return shopping_list.id
+
+
 async def get_shopping_categories(
     session: AsyncSession,
     *,

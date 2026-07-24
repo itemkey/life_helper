@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from html import escape
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -16,11 +17,14 @@ from app.services import shopping
 from app.services.access import AccessLevel
 from app.services.errors import AccessDenied, LifeHelperError, ListNotFound, ValidationError
 from app.tgbot.keyboards import (
+    EXPENSE_DELETE_PAGE_SIZE,
     cancel_keyboard,
     delete_confirm_keyboard,
     expense_categories_keyboard,
     expense_category_keyboard,
     expense_category_split_keyboard,
+    expense_delete_confirm_keyboard,
+    expense_deletion_keyboard,
     expense_participants_keyboard,
     expense_source_keyboard,
     expense_split_keyboard,
@@ -194,7 +198,39 @@ async def _show_money(target: Message | CallbackQuery, session: AsyncSession, us
     await _send_or_edit(
         target,
         format_money_text(summary),
-        reply_markup=money_keyboard(summary.shopping_list),
+        reply_markup=money_keyboard(summary.shopping_list, has_expenses=bool(summary.expenses)),
+    )
+
+
+async def _show_expense_deletion_list(
+    target: Message | CallbackQuery,
+    session: AsyncSession,
+    user_id: int,
+    list_id: int,
+    *,
+    page: int,
+) -> None:
+    await _clear_current_list_view(target, session, user_id)
+    summary = await shopping.get_money_summary(session, user_id=user_id, list_id=list_id)
+    expenses = list(reversed(summary.expenses))
+    total_pages = max(1, (len(expenses) + EXPENSE_DELETE_PAGE_SIZE - 1) // EXPENSE_DELETE_PAGE_SIZE)
+    current_page = min(max(page, 0), total_pages - 1)
+    if expenses:
+        text = (
+            f"<b>Удаление трат: {escape(summary.shopping_list.title)}</b>\n\n"
+            "Выбери трату. После подтверждения она исчезнет из списка и расчётов денег.\n\n"
+            f"Страница {current_page + 1} из {total_pages}"
+        )
+    else:
+        text = f"<b>Удаление трат: {escape(summary.shopping_list.title)}</b>\n\nТрат пока нет."
+    await _send_or_edit(
+        target,
+        text,
+        reply_markup=expense_deletion_keyboard(
+            summary.shopping_list,
+            expenses,
+            page=current_page,
+        ),
     )
 
 
@@ -289,7 +325,7 @@ async def _show_money_final(target: Message | CallbackQuery, session: AsyncSessi
     await _send_or_edit(
         target,
         format_money_final_text(summary),
-        reply_markup=money_keyboard(summary.shopping_list),
+        reply_markup=money_keyboard(summary.shopping_list, has_expenses=bool(summary.expenses)),
     )
 
 
@@ -596,6 +632,97 @@ async def callback_money_final(query: CallbackQuery, state: FSMContext, session:
         return
     try:
         await _show_money_final(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_delete_list:"))
+async def callback_expense_delete_list(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    await state.clear()
+    list_id = _parse_id(query.data, "expense_delete_list:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_expense_deletion_list(query, session, user_id, list_id, page=0)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_delete_page:"))
+async def callback_expense_delete_page(
+    query: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_delete_page:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    list_id, page = parsed
+    try:
+        await _show_expense_deletion_list(query, session, user_id, list_id, page=page)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_delete_confirm:"))
+async def callback_expense_delete_confirm(
+    query: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_delete_confirm:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        shopping_list, expense = await shopping.get_expense(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+        )
+        category_prefix = f"{escape(expense.category.title)}: " if expense.category is not None else ""
+        await _send_or_edit(
+            query,
+            (
+                f"Удалить трату «{category_prefix}{escape(expense.title)}: "
+                f"{shopping.format_money_amount(expense.amount, shopping_list.currency)}»?\n\n"
+                "Она исчезнет из списка и расчётов денег."
+            ),
+            reply_markup=expense_delete_confirm_keyboard(
+                expense_id=expense.id,
+                list_id=shopping_list.id,
+                page=page,
+            ),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_delete_apply:"))
+async def callback_expense_delete_apply(
+    query: CallbackQuery,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_delete_apply:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        list_id = await shopping.delete_expense(session, user_id=user_id, expense_id=expense_id)
+        await session.commit()
+        await _show_expense_deletion_list(query, session, user_id, list_id, page=page)
+        await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 

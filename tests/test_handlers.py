@@ -25,6 +25,9 @@ from app.tgbot.handlers import (
     callback_expense_category_add,
     callback_expense_category_delete,
     callback_expense_category_set_split,
+    callback_expense_delete_apply,
+    callback_expense_delete_confirm,
+    callback_expense_delete_list,
     callback_expense_payer_other,
     callback_expense_payer_select,
     callback_expense_payer_self,
@@ -983,6 +986,64 @@ async def test_expense_category_delete_handler_removes_category(session):
     summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
     assert summary.expenses == []
     assert summary.cashbox_balance == 0
+
+
+async def test_old_uncategorized_expense_can_be_deleted_from_money_screen(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    expense = await shopping.create_expense(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Маршрутка",
+        amount="12",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[100],
+    )
+    state = FakeState()
+    bot = FakeBot()
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_expense_delete_list(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"expense_delete_list:{shopping_list.id}",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
+    assert any(
+        button.text == "Маршрутка — 12.00 BYN"
+        and button.callback_data == f"expense_delete_confirm:{expense.id}:0"
+        for button in buttons
+    )
+
+    await callback_expense_delete_confirm(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"expense_delete_confirm:{expense.id}:0",
+            message=query_message,
+        ),
+        session,
+    )
+    assert "Удалить трату «Маршрутка: 12.00 BYN»?" in query_message.edits[-1][0]
+
+    await callback_expense_delete_apply(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"expense_delete_apply:{expense.id}:0",
+            message=query_message,
+        ),
+        bot,
+        session,
+    )
+
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert summary.expenses == []
+    assert summary.cashbox_balance == 0
+    assert "Трат пока нет" in query_message.edits[-1][0]
 
 
 async def test_expense_category_default_all_flow_has_fast_default_button(session):

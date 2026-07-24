@@ -4,8 +4,11 @@ from collections.abc import Sequence
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.db.models import ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
+from app.db.models import Expense, ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
 from app.services.access import AccessLevel
+
+
+EXPENSE_DELETE_PAGE_SIZE = 8
 
 
 def _short(text: str, limit: int = 42) -> str:
@@ -265,18 +268,93 @@ def payer_participants_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def money_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
+def money_keyboard(shopping_list: ShoppingList, *, has_expenses: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Взнос", callback_data=f"contribution:{shopping_list.id}"),
+            InlineKeyboardButton(text="Трата", callback_data=f"expense:{shopping_list.id}"),
+        ],
+        [
+            InlineKeyboardButton(text="Категории трат", callback_data=f"categories:{shopping_list.id}"),
+            InlineKeyboardButton(text="Итог", callback_data=f"money_final:{shopping_list.id}"),
+        ],
+    ]
+    if has_expenses:
+        rows.append(
+            [InlineKeyboardButton(text="Удалить трату", callback_data=f"expense_delete_list:{shopping_list.id}")]
+        )
+    rows.append([InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{shopping_list.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _expense_delete_label(expense: Expense, currency: str) -> str:
+    amount = abs(expense.amount)
+    sign = "-" if expense.amount < 0 else ""
+    money = f"{sign}{amount // 100}.{amount % 100:02d} {currency}"
+    category_prefix = f"{expense.category.title}: " if expense.category is not None else ""
+    return _short(f"{category_prefix}{expense.title} — {money}", 54)
+
+
+def expense_deletion_keyboard(
+    shopping_list: ShoppingList,
+    expenses: Sequence[Expense],
+    *,
+    page: int,
+) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(expenses) + EXPENSE_DELETE_PAGE_SIZE - 1) // EXPENSE_DELETE_PAGE_SIZE)
+    current_page = min(max(page, 0), total_pages - 1)
+    start = current_page * EXPENSE_DELETE_PAGE_SIZE
+    page_expenses = expenses[start : start + EXPENSE_DELETE_PAGE_SIZE]
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_expense_delete_label(expense, shopping_list.currency),
+                callback_data=f"expense_delete_confirm:{expense.id}:{current_page}",
+            )
+        ]
+        for expense in page_expenses
+    ]
+    navigation: list[InlineKeyboardButton] = []
+    if current_page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="← Назад",
+                callback_data=f"expense_delete_page:{shopping_list.id}:{current_page - 1}",
+            )
+        )
+    if current_page + 1 < total_pages:
+        navigation.append(
+            InlineKeyboardButton(
+                text="Дальше →",
+                callback_data=f"expense_delete_page:{shopping_list.id}:{current_page + 1}",
+            )
+        )
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text="Назад к деньгам", callback_data=f"money:{shopping_list.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def expense_delete_confirm_keyboard(
+    *,
+    expense_id: int,
+    list_id: int,
+    page: int,
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Взнос", callback_data=f"contribution:{shopping_list.id}"),
-                InlineKeyboardButton(text="Трата", callback_data=f"expense:{shopping_list.id}"),
+                InlineKeyboardButton(
+                    text="Да, удалить",
+                    callback_data=f"expense_delete_apply:{expense_id}:{page}",
+                )
             ],
             [
-                InlineKeyboardButton(text="Категории трат", callback_data=f"categories:{shopping_list.id}"),
-                InlineKeyboardButton(text="Итог", callback_data=f"money_final:{shopping_list.id}"),
+                InlineKeyboardButton(
+                    text="Нет, назад",
+                    callback_data=f"expense_delete_page:{list_id}:{page}",
+                )
             ],
-            [InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{shopping_list.id}")],
         ]
     )
 

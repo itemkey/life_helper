@@ -671,6 +671,31 @@ async def test_expense_category_deletion_removes_only_its_expenses_and_shares(se
     assert summary.cashbox_balance == 0
 
 
+async def test_individual_expense_deletion_removes_old_uncategorized_expense(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    expense = await shopping.create_expense(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Маршрутка",
+        amount="12",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[100],
+    )
+
+    list_id = await shopping.delete_expense(session, user_id=100, expense_id=expense.id)
+
+    assert list_id == shopping_list.id
+    assert await session.get(Expense, expense.id) is None
+    assert await session.scalar(
+        select(ExpenseShare).where(ExpenseShare.expense_id == expense.id)
+    ) is None
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert summary.expenses == []
+    assert summary.cashbox_balance == 0
+
+
 async def test_expense_category_default_split_can_be_changed(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
