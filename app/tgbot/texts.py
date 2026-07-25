@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from html import escape
 
-from app.db.models import ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
+from app.db.models import Expense, ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
 from app.services.access import AccessLevel
 from app.services.shopping import (
     EXPENSE_SOURCE_CASHBOX,
@@ -211,6 +211,39 @@ def _format_expense_meta(expense: object) -> str:
     if source == EXPENSE_SOURCE_CASHBOX:
         return f"касса, долей: {split_count}"
     return f"из своих, платил {_format_user_name(getattr(expense, 'payer'))}, долей: {split_count}"
+
+
+def format_expense_management_text(
+    shopping_list: ShoppingList,
+    expense: Expense,
+    *,
+    can_manage: bool,
+    is_manual: bool,
+) -> str:
+    category = escape(expense.category.title) if expense.category is not None else "без категории"
+    if expense.source == EXPENSE_SOURCE_CASHBOX:
+        payment = "из кассы"
+    else:
+        payment = f"из кармана — {_format_user_name(expense.payer)}"
+    participants = ", ".join(
+        f"{_format_user_name(share.user)} ({format_money_amount(share.amount, shopping_list.currency)})"
+        for share in expense.shares
+    )
+    author = _format_user_name(expense.created_by) if expense.created_by is not None else "неизвестен"
+    lines = [
+        f"<b>Трата: {escape(expense.title)}</b>",
+        "",
+        f"Сумма: {format_money_amount(expense.amount, shopping_list.currency)}",
+        f"Категория: {category}",
+        f"Оплата: {payment}",
+        f"Участники: {participants or 'не выбраны'}",
+        f"Автор записи: {author}",
+    ]
+    if not is_manual:
+        lines.extend(["", "Трата связана с покупкой или чеком, поэтому отдельно редактировать её нельзя."])
+    if not can_manage:
+        lines.extend(["", "Изменять и удалять эту трату может только её автор или владелец тусовки."])
+    return "\n".join(lines)
 
 
 def _format_balance_action(balance: int, currency: str) -> str:

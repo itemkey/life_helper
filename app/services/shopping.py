@@ -511,7 +511,9 @@ async def get_expense(
             selectinload(Expense.category),
             selectinload(Expense.item),
             selectinload(Expense.item_links).selectinload(ExpenseItem.item),
-            selectinload(Expense.shares),
+            selectinload(Expense.payer),
+            selectinload(Expense.created_by),
+            selectinload(Expense.shares).selectinload(ExpenseShare.user),
         )
         .where(Expense.id == expense_id)
     )
@@ -521,6 +523,180 @@ async def get_expense(
     return shopping_list, expense
 
 
+def is_manual_expense(expense: Expense) -> bool:
+    return expense.item is None and not expense.item_links
+
+
+def can_manage_expense(shopping_list: ShoppingList, expense: Expense, *, user_id: int) -> bool:
+    return shopping_list.owner_id == user_id or expense.created_by_id == user_id
+
+
+def _ensure_expense_management_allowed(
+    shopping_list: ShoppingList,
+    expense: Expense,
+    *,
+    user_id: int,
+) -> None:
+    if can_manage_expense(shopping_list, expense, user_id=user_id):
+        return
+    raise AccessDenied("Изменять и удалять трату может только её автор или владелец тусовки.")
+
+
+def _ensure_manual_expense(expense: Expense) -> None:
+    if is_manual_expense(expense):
+        return
+    raise ValidationError("Трата связана с покупкой или чеком и не может редактироваться отдельно.")
+
+
+async def _get_manual_expense_for_update(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+) -> tuple[ShoppingList, Expense]:
+    shopping_list, expense = await get_expense(session, user_id=user_id, expense_id=expense_id)
+    _ensure_expense_management_allowed(shopping_list, expense, user_id=user_id)
+    _ensure_manual_expense(expense)
+    return shopping_list, expense
+
+
+async def update_expense_title(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+    title: str,
+) -> Expense:
+    _, expense = await _get_manual_expense_for_update(
+        session,
+        user_id=user_id,
+        expense_id=expense_id,
+    )
+    expense.title = _normalize_expense_title(title)
+    await session.flush()
+    return expense
+
+
+async def update_expense_amount(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+    amount: str | int,
+) -> Expense:
+    _, expense = await _get_manual_expense_for_update(
+        session,
+        user_id=user_id,
+        expense_id=expense_id,
+    )
+    amount_minor = parse_money_amount(amount)
+    shares = _split_amount(amount_minor, [share.user_id for share in expense.shares])
+    expense.amount = amount_minor
+    for share in expense.shares:
+        share.amount = shares[share.user_id]
+    await session.flush()
+    return expense
+
+
+async def update_expense_category(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+    category_id: int | None,
+) -> Expense:
+    shopping_list, expense = await _get_manual_expense_for_update(
+        session,
+        user_id=user_id,
+        expense_id=expense_id,
+    )
+    category: ExpenseCategory | None = None
+    if category_id is not None:
+        category = await session.get(ExpenseCategory, category_id)
+        if category is None or category.list_id != shopping_list.id:
+            raise ValidationError("Категория должна принадлежать этой тусовке.")
+    expense.category_id = category.id if category is not None else None
+    expense.category = category
+    await session.flush()
+    return expense
+
+
+async def update_expense_payment(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+    source: str,
+    payer_id: int | None = None,
+) -> Expense:
+    shopping_list, expense = await _get_manual_expense_for_update(
+        session,
+        user_id=user_id,
+        expense_id=expense_id,
+    )
+    if source not in {EXPENSE_SOURCE_CASHBOX, EXPENSE_SOURCE_PERSONAL}:
+        raise ValidationError("Не понял источник оплаты.")
+
+    if source == EXPENSE_SOURCE_PERSONAL:
+        if payer_id is None:
+            raise ValidationError("Выбери, кто оплатил трату.")
+        participants = await _get_participant_users(session, shopping_list)
+        payer = next((participant for participant in participants if participant.id == payer_id), None)
+        if payer is None:
+            raise ValidationError("Плательщик должен быть участником тусовки.")
+        expense.payer_id = payer_id
+        expense.payer = payer
+    expense.source = source
+    await session.flush()
+    return expense
+
+
+async def update_expense_shares(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+    share_user_ids: Sequence[int],
+) -> Expense:
+    shopping_list, expense = await _get_manual_expense_for_update(
+        session,
+        user_id=user_id,
+        expense_id=expense_id,
+    )
+    participants = await _get_participant_users(session, shopping_list)
+    participants_by_id = {participant.id: participant for participant in participants}
+    requested_user_ids = list(dict.fromkeys(share_user_ids))
+    requested_user_id_set = set(requested_user_ids)
+    if any(selected_user_id not in participants_by_id for selected_user_id in requested_user_id_set):
+        raise ValidationError("Можно распределять траты только между участниками тусовки.")
+    selected_user_ids = [
+        participant.id
+        for participant in participants
+        if participant.id in requested_user_id_set
+    ]
+    shares = _split_amount(expense.amount, selected_user_ids)
+    existing_shares = {share.user_id: share for share in expense.shares}
+    for share_user_id, share in list(existing_shares.items()):
+        if share_user_id not in shares:
+            expense.shares.remove(share)
+    for share_user_id, share_amount in shares.items():
+        share = existing_shares.get(share_user_id)
+        if share is None:
+            expense.shares.append(
+                ExpenseShare(
+                    expense_id=expense.id,
+                    user_id=share_user_id,
+                    amount=share_amount,
+                    user=participants_by_id[share_user_id],
+                )
+            )
+        else:
+            share.amount = share_amount
+    expense.shares.sort(key=lambda share: share.user_id)
+    await session.flush()
+    return expense
+
+
 async def delete_expense(
     session: AsyncSession,
     *,
@@ -528,6 +704,7 @@ async def delete_expense(
     expense_id: int,
 ) -> int:
     shopping_list, expense = await get_expense(session, user_id=user_id, expense_id=expense_id)
+    _ensure_expense_management_allowed(shopping_list, expense, user_id=user_id)
     if expense.item is not None:
         expense.item.is_done = False
     for item_link in expense.item_links:
@@ -1321,6 +1498,7 @@ async def cancel_receipt_expense(
     if expense is None:
         raise ListNotFound("Чек не найден.")
     shopping_list, _ = await require_access(session, user_id=user_id, list_id=expense.list_id)
+    _ensure_expense_management_allowed(shopping_list, expense, user_id=user_id)
     if expense.item_id is not None or not expense.item_links:
         raise ValidationError("Это не чековая покупка.")
     for item_link in expense.item_links:

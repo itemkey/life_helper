@@ -18,5 +18,8 @@ class ShoppingListStates(StatesGroup):
     choosing_expense_source = State()
     choosing_expense_payer = State()
     choosing_expense_split = State()
+    editing_expense_title = State()
+    editing_expense_amount = State()
+    editing_expense_shares = State()
     renaming_expense_category = State()
     renaming_list = State()

@@ -696,6 +696,197 @@ async def test_individual_expense_deletion_removes_old_uncategorized_expense(ses
     assert summary.cashbox_balance == 0
 
 
+async def test_manual_expense_can_be_fully_updated_and_rebalances_shares(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, first_name="Owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, first_name="Author"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    category = await shopping.create_expense_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Транспорт",
+    )
+    expense = await shopping.create_expense(
+        session,
+        user_id=200,
+        list_id=shopping_list.id,
+        title="Марша",
+        amount="10.01",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[100, 200],
+    )
+
+    await shopping.update_expense_title(
+        session,
+        user_id=200,
+        expense_id=expense.id,
+        title="  Маршрутка  ",
+    )
+    await shopping.update_expense_amount(
+        session,
+        user_id=200,
+        expense_id=expense.id,
+        amount="12.01",
+    )
+    await shopping.update_expense_category(
+        session,
+        user_id=200,
+        expense_id=expense.id,
+        category_id=category.id,
+    )
+    await shopping.update_expense_payment(
+        session,
+        user_id=200,
+        expense_id=expense.id,
+        source=shopping.EXPENSE_SOURCE_PERSONAL,
+        payer_id=100,
+    )
+    await shopping.update_expense_shares(
+        session,
+        user_id=200,
+        expense_id=expense.id,
+        share_user_ids=[200],
+    )
+    await shopping.update_expense_shares(
+        session,
+        user_id=200,
+        expense_id=expense.id,
+        share_user_ids=[100, 200],
+    )
+
+    _, updated = await shopping.get_expense(session, user_id=200, expense_id=expense.id)
+    assert updated.title == "Маршрутка"
+    assert updated.amount == 1201
+    assert updated.category_id == category.id
+    assert updated.source == shopping.EXPENSE_SOURCE_PERSONAL
+    assert updated.payer_id == 100
+    assert [(share.user_id, share.amount) for share in updated.shares] == [(100, 601), (200, 600)]
+    assert [share.user.first_name for share in updated.shares] == ["Owner", "Author"]
+
+    await shopping.update_expense_title(
+        session,
+        user_id=100,
+        expense_id=expense.id,
+        title="Исправлено владельцем",
+    )
+    assert expense.title == "Исправлено владельцем"
+
+
+async def test_expense_management_is_limited_to_author_and_owner(session):
+    for user_id in (100, 200, 300):
+        await shopping.upsert_user(session, FakeTelegramUser(id=user_id))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    await shopping.join_public_list_by_token(session, user_id=300, token=token)
+    expense = await shopping.create_expense(
+        session,
+        user_id=200,
+        list_id=shopping_list.id,
+        title="Марша",
+        amount="6",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[200],
+    )
+
+    with pytest.raises(AccessDenied):
+        await shopping.update_expense_title(
+            session,
+            user_id=300,
+            expense_id=expense.id,
+            title="Чужое изменение",
+        )
+    with pytest.raises(AccessDenied):
+        await shopping.delete_expense(session, user_id=300, expense_id=expense.id)
+
+    expense.created_by_id = None
+    await session.flush()
+    with pytest.raises(AccessDenied):
+        await shopping.update_expense_amount(
+            session,
+            user_id=200,
+            expense_id=expense.id,
+            amount="7",
+        )
+    await shopping.update_expense_amount(
+        session,
+        user_id=100,
+        expense_id=expense.id,
+        amount="7",
+    )
+    assert expense.amount == 700
+
+
+async def test_manual_expense_update_validates_links_category_and_participants(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    first_list = await shopping.create_shopping_list(session, owner_id=100, title="Первая")
+    second_list = await shopping.create_shopping_list(session, owner_id=200, title="Вторая")
+    foreign_category = await shopping.create_expense_category(
+        session,
+        user_id=200,
+        list_id=second_list.id,
+        title="Чужая",
+    )
+    expense = await shopping.create_expense(
+        session,
+        user_id=100,
+        list_id=first_list.id,
+        title="Разовая",
+        amount="6",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[100],
+    )
+
+    with pytest.raises(ValidationError):
+        await shopping.update_expense_category(
+            session,
+            user_id=100,
+            expense_id=expense.id,
+            category_id=foreign_category.id,
+        )
+    with pytest.raises(ValidationError):
+        await shopping.update_expense_payment(
+            session,
+            user_id=100,
+            expense_id=expense.id,
+            source=shopping.EXPENSE_SOURCE_PERSONAL,
+            payer_id=200,
+        )
+    with pytest.raises(ValidationError):
+        await shopping.update_expense_shares(
+            session,
+            user_id=100,
+            expense_id=expense.id,
+            share_user_ids=[],
+        )
+
+    items = await shopping.add_items(
+        session,
+        user_id=100,
+        list_id=first_list.id,
+        text="Билет",
+    )
+    await shopping.record_item_purchase(
+        session,
+        user_id=100,
+        item_id=items[0].id,
+        amount="5",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+    )
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=first_list.id)
+    linked_expense = next(item for item in summary.expenses if item.item_id == items[0].id)
+    with pytest.raises(ValidationError):
+        await shopping.update_expense_title(
+            session,
+            user_id=100,
+            expense_id=linked_expense.id,
+            title="Нельзя",
+        )
+
+
 async def test_expense_category_default_split_can_be_changed(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")

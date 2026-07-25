@@ -281,13 +281,13 @@ def money_keyboard(shopping_list: ShoppingList, *, has_expenses: bool = False) -
     ]
     if has_expenses:
         rows.append(
-            [InlineKeyboardButton(text="Удалить трату", callback_data=f"expense_delete_list:{shopping_list.id}")]
+            [InlineKeyboardButton(text="Управление тратами", callback_data=f"expense_manage_list:{shopping_list.id}")]
         )
     rows.append([InlineKeyboardButton(text="Назад", callback_data=f"open:{shopping_list.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _expense_delete_label(expense: Expense, currency: str) -> str:
+def _expense_management_label(expense: Expense, currency: str) -> str:
     amount = abs(expense.amount)
     sign = "-" if expense.amount < 0 else ""
     money = f"{sign}{amount // 100}.{amount % 100:02d} {currency}"
@@ -295,7 +295,7 @@ def _expense_delete_label(expense: Expense, currency: str) -> str:
     return _short(f"{category_prefix}{expense.title} — {money}", 54)
 
 
-def expense_deletion_keyboard(
+def expense_management_keyboard(
     shopping_list: ShoppingList,
     expenses: Sequence[Expense],
     *,
@@ -308,8 +308,8 @@ def expense_deletion_keyboard(
     rows = [
         [
             InlineKeyboardButton(
-                text=_expense_delete_label(expense, shopping_list.currency),
-                callback_data=f"expense_delete_confirm:{expense.id}:{current_page}",
+                text=_expense_management_label(expense, shopping_list.currency),
+                callback_data=f"expense_manage_open:{expense.id}:{current_page}",
             )
         ]
         for expense in page_expenses
@@ -319,19 +319,83 @@ def expense_deletion_keyboard(
         navigation.append(
             InlineKeyboardButton(
                 text="← Назад",
-                callback_data=f"expense_delete_page:{shopping_list.id}:{current_page - 1}",
+                callback_data=f"expense_manage_page:{shopping_list.id}:{current_page - 1}",
             )
         )
     if current_page + 1 < total_pages:
         navigation.append(
             InlineKeyboardButton(
                 text="Дальше →",
-                callback_data=f"expense_delete_page:{shopping_list.id}:{current_page + 1}",
+                callback_data=f"expense_manage_page:{shopping_list.id}:{current_page + 1}",
             )
         )
     if navigation:
         rows.append(navigation)
     rows.append([InlineKeyboardButton(text="Назад к деньгам", callback_data=f"money:{shopping_list.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def expense_management_detail_keyboard(
+    expense: Expense,
+    *,
+    list_id: int,
+    page: int,
+    can_manage: bool,
+    is_manual: bool,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_manage and is_manual:
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="Изменить название",
+                        callback_data=f"expense_manage_title:{expense.id}:{page}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Изменить сумму",
+                        callback_data=f"expense_manage_amount:{expense.id}:{page}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Изменить категорию",
+                        callback_data=f"expense_manage_category:{expense.id}:{page}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Изменить оплату",
+                        callback_data=f"expense_manage_payment:{expense.id}:{page}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Изменить участников",
+                        callback_data=f"expense_manage_shares:{expense.id}:{page}",
+                    )
+                ],
+            ]
+        )
+    if can_manage:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Удалить",
+                    callback_data=f"expense_delete_confirm:{expense.id}:{page}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Назад к тратам",
+                callback_data=f"expense_manage_page:{list_id}:{page}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -352,11 +416,133 @@ def expense_delete_confirm_keyboard(
             [
                 InlineKeyboardButton(
                     text="Нет, назад",
-                    callback_data=f"expense_delete_page:{list_id}:{page}",
+                    callback_data=f"expense_manage_open:{expense_id}:{page}",
                 )
             ],
         ]
     )
+
+
+def expense_management_category_keyboard(
+    expense: Expense,
+    categories: Sequence[ExpenseCategory],
+    *,
+    page: int,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=("✓ " if expense.category_id == category.id else "") + _short(category.title, 46),
+                callback_data=f"expense_manage_category_set:{expense.id}:{category.id}:{page}",
+            )
+        ]
+        for category in categories
+    ]
+    none_mark = "✓ " if expense.category_id is None else ""
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=f"{none_mark}Без категории",
+                callback_data=f"expense_manage_category_none:{expense.id}:{page}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data=f"expense_manage_open:{expense.id}:{page}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def expense_management_payment_keyboard(expense_id: int, *, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Из кассы",
+                    callback_data=f"expense_manage_source:{expense_id}:cashbox:{page}",
+                ),
+                InlineKeyboardButton(
+                    text="Из кармана",
+                    callback_data=f"expense_manage_source:{expense_id}:personal:{page}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=f"expense_manage_open:{expense_id}:{page}",
+                )
+            ],
+        ]
+    )
+
+
+def expense_management_payer_keyboard(
+    expense_id: int,
+    participants: Sequence[User],
+    *,
+    page: int,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_user_label(user),
+                callback_data=f"expense_manage_payer:{expense_id}:{user.id}:{page}",
+            )
+        ]
+        for user in participants
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data=f"expense_manage_open:{expense_id}:{page}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def expense_management_participants_keyboard(
+    expense_id: int,
+    participants: Sequence[User],
+    selected_user_ids: Sequence[int],
+    *,
+    page: int,
+) -> InlineKeyboardMarkup:
+    selected = set(selected_user_ids)
+    rows: list[list[InlineKeyboardButton]] = []
+    for user in participants:
+        mark = "✓" if user.id in selected else "□"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark} {_user_label(user)}",
+                    callback_data=f"expense_manage_share_toggle:{expense_id}:{user.id}:{page}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Готово",
+                callback_data=f"expense_manage_share_done:{expense_id}:{page}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data=f"expense_manage_open:{expense_id}:{page}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def expense_categories_keyboard(
@@ -375,6 +561,7 @@ def expense_categories_keyboard(
         )
     rows.append([InlineKeyboardButton(text="Разовая трата без категории", callback_data=f"expense_custom:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Добавить категорию", callback_data=f"category_add:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Управление тратами", callback_data=f"expense_manage_list:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Назад к деньгам", callback_data=f"money:{shopping_list.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

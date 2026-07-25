@@ -24,7 +24,12 @@ from app.tgbot.keyboards import (
     expense_category_keyboard,
     expense_category_split_keyboard,
     expense_delete_confirm_keyboard,
-    expense_deletion_keyboard,
+    expense_management_category_keyboard,
+    expense_management_detail_keyboard,
+    expense_management_keyboard,
+    expense_management_participants_keyboard,
+    expense_management_payer_keyboard,
+    expense_management_payment_keyboard,
     expense_participants_keyboard,
     expense_source_keyboard,
     expense_split_keyboard,
@@ -52,6 +57,7 @@ from app.tgbot.texts import (
     format_categories_text,
     format_expense_category_split_text,
     format_expense_category_text,
+    format_expense_management_text,
     format_list_text,
     format_lists_text,
     format_money_final_text,
@@ -133,6 +139,30 @@ def _parse_two_ids(value: str | None, prefix: str) -> tuple[int, int] | None:
         return None
 
 
+def _parse_three_ids(value: str | None, prefix: str) -> tuple[int, int, int] | None:
+    if not value or not value.startswith(prefix):
+        return None
+    parts = value.removeprefix(prefix).split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+def _parse_expense_source(value: str | None, prefix: str) -> tuple[int, str, int] | None:
+    if not value or not value.startswith(prefix):
+        return None
+    parts = value.removeprefix(prefix).split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[0]), parts[1], int(parts[2])
+    except ValueError:
+        return None
+
+
 def _message_identity(message: Any | None) -> tuple[int, int] | None:
     if message is None:
         return None
@@ -202,7 +232,7 @@ async def _show_money(target: Message | CallbackQuery, session: AsyncSession, us
     )
 
 
-async def _show_expense_deletion_list(
+async def _show_expense_management_list(
     target: Message | CallbackQuery,
     session: AsyncSession,
     user_id: int,
@@ -217,19 +247,53 @@ async def _show_expense_deletion_list(
     current_page = min(max(page, 0), total_pages - 1)
     if expenses:
         text = (
-            f"<b>Удаление трат: {escape(summary.shopping_list.title)}</b>\n\n"
-            "Выбери трату. После подтверждения она исчезнет из списка и расчётов денег.\n\n"
+            f"<b>Управление тратами: {escape(summary.shopping_list.title)}</b>\n\n"
+            "Выбери трату, чтобы посмотреть подробности, изменить или удалить её.\n\n"
             f"Страница {current_page + 1} из {total_pages}"
         )
     else:
-        text = f"<b>Удаление трат: {escape(summary.shopping_list.title)}</b>\n\nТрат пока нет."
+        text = f"<b>Управление тратами: {escape(summary.shopping_list.title)}</b>\n\nТрат пока нет."
     await _send_or_edit(
         target,
         text,
-        reply_markup=expense_deletion_keyboard(
+        reply_markup=expense_management_keyboard(
             summary.shopping_list,
             expenses,
             page=current_page,
+        ),
+    )
+
+
+async def _show_expense_management_detail(
+    target: Message | CallbackQuery,
+    session: AsyncSession,
+    user_id: int,
+    expense_id: int,
+    *,
+    page: int,
+) -> None:
+    await _clear_current_list_view(target, session, user_id)
+    shopping_list, expense = await shopping.get_expense(
+        session,
+        user_id=user_id,
+        expense_id=expense_id,
+    )
+    can_manage = shopping.can_manage_expense(shopping_list, expense, user_id=user_id)
+    is_manual = shopping.is_manual_expense(expense)
+    await _send_or_edit(
+        target,
+        format_expense_management_text(
+            shopping_list,
+            expense,
+            can_manage=can_manage,
+            is_manual=is_manual,
+        ),
+        reply_markup=expense_management_detail_keyboard(
+            expense,
+            list_id=shopping_list.id,
+            page=page,
+            can_manage=can_manage,
+            is_manual=is_manual,
         ),
     )
 
@@ -344,6 +408,8 @@ async def _show_cancel_return(
     destination = str(data.get("cancel_return") or "")
     list_id = int(data.get("cancel_list_id") or data.get("list_id") or 0)
     category_id = int(data.get("cancel_category_id") or data.get("category_id") or 0)
+    expense_id = int(data.get("cancel_expense_id") or data.get("expense_id") or 0)
+    expense_page = int(data.get("cancel_expense_page") or 0)
 
     try:
         if destination == "list" and list_id:
@@ -366,6 +432,15 @@ async def _show_cancel_return(
             return
         if destination == "expense_category" and category_id:
             await _show_expense_category(target, session, user_id, category_id)
+            return
+        if destination == "expense_management_detail" and expense_id:
+            await _show_expense_management_detail(
+                target,
+                session,
+                user_id,
+                expense_id,
+                page=expense_page,
+            )
             return
         if destination == "settings" and list_id:
             await _show_settings(target, session, user_id, list_id)
@@ -636,6 +711,49 @@ async def callback_money_final(query: CallbackQuery, state: FSMContext, session:
         await _handle_service_error(query, error)
 
 
+async def _get_editable_manual_expense(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+) -> tuple[Any, Any]:
+    shopping_list, expense = await shopping.get_expense(
+        session,
+        user_id=user_id,
+        expense_id=expense_id,
+    )
+    if not shopping.can_manage_expense(shopping_list, expense, user_id=user_id):
+        raise AccessDenied("Изменять и удалять трату может только её автор или владелец тусовки.")
+    if not shopping.is_manual_expense(expense):
+        raise ValidationError("Трата связана с покупкой или чеком и не может редактироваться отдельно.")
+    return shopping_list, expense
+
+
+async def _finish_expense_update(
+    target: Message | CallbackQuery,
+    state: FSMContext | None,
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    user_id: int,
+    expense_id: int,
+    list_id: int,
+    page: int,
+) -> None:
+    await session.commit()
+    if state is not None:
+        await state.clear()
+    await _show_expense_management_detail(
+        target,
+        session,
+        user_id,
+        expense_id,
+        page=page,
+    )
+    await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
+
+
+@router.callback_query(F.data.startswith("expense_manage_list:"))
 @router.callback_query(F.data.startswith("expense_delete_list:"))
 async def callback_expense_delete_list(
     query: CallbackQuery,
@@ -644,29 +762,57 @@ async def callback_expense_delete_list(
 ) -> None:
     user_id = await _ensure_user(session, query.from_user)
     await state.clear()
-    list_id = _parse_id(query.data, "expense_delete_list:")
+    prefix = "expense_manage_list:" if (query.data or "").startswith("expense_manage_list:") else "expense_delete_list:"
+    list_id = _parse_id(query.data, prefix)
     if list_id is None:
         await _answer_callback(query, "Не понял кнопку.", show_alert=True)
         return
     try:
-        await _show_expense_deletion_list(query, session, user_id, list_id, page=0)
+        await _show_expense_management_list(query, session, user_id, list_id, page=0)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
 
+@router.callback_query(F.data.startswith("expense_manage_page:"))
 @router.callback_query(F.data.startswith("expense_delete_page:"))
 async def callback_expense_delete_page(
     query: CallbackQuery,
     session: AsyncSession,
 ) -> None:
     user_id = await _ensure_user(session, query.from_user)
-    parsed = _parse_two_ids(query.data, "expense_delete_page:")
+    prefix = "expense_manage_page:" if (query.data or "").startswith("expense_manage_page:") else "expense_delete_page:"
+    parsed = _parse_two_ids(query.data, prefix)
     if parsed is None:
         await _answer_callback(query, "Не понял кнопку.", show_alert=True)
         return
     list_id, page = parsed
     try:
-        await _show_expense_deletion_list(query, session, user_id, list_id, page=page)
+        await _show_expense_management_list(query, session, user_id, list_id, page=page)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_open:"))
+async def callback_expense_manage_open(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    await state.clear()
+    parsed = _parse_two_ids(query.data, "expense_manage_open:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        await _show_expense_management_detail(
+            query,
+            session,
+            user_id,
+            expense_id,
+            page=page,
+        )
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -688,6 +834,8 @@ async def callback_expense_delete_confirm(
             user_id=user_id,
             expense_id=expense_id,
         )
+        if not shopping.can_manage_expense(shopping_list, expense, user_id=user_id):
+            raise AccessDenied("Изменять и удалять трату может только её автор или владелец тусовки.")
         category_prefix = f"{escape(expense.category.title)}: " if expense.category is not None else ""
         await _send_or_edit(
             query,
@@ -721,8 +869,503 @@ async def callback_expense_delete_apply(
     try:
         list_id = await shopping.delete_expense(session, user_id=user_id, expense_id=expense_id)
         await session.commit()
-        await _show_expense_deletion_list(query, session, user_id, list_id, page=page)
+        await _show_expense_management_list(query, session, user_id, list_id, page=page)
         await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_title:"))
+async def callback_expense_manage_title(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_manage_title:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        shopping_list, expense = await _get_editable_manual_expense(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+        )
+        await state.set_state(ShoppingListStates.editing_expense_title)
+        await state.update_data(
+            expense_id=expense.id,
+            expense_page=page,
+            cancel_return="expense_management_detail",
+            cancel_list_id=shopping_list.id,
+            cancel_expense_id=expense.id,
+            cancel_expense_page=page,
+        )
+        await _send_or_edit(
+            query,
+            f"Новое название для траты «{escape(expense.title)}»?",
+            reply_markup=cancel_keyboard(),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.message(ShoppingListStates.editing_expense_title)
+async def state_edit_expense_title(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, message.from_user)
+    data = await state.get_data()
+    expense_id = int(data.get("expense_id", 0))
+    page = int(data.get("expense_page", 0))
+    try:
+        expense = await shopping.update_expense_title(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+            title=message.text or "",
+        )
+        await _finish_expense_update(
+            message,
+            state,
+            bot,
+            session,
+            user_id=user_id,
+            expense_id=expense.id,
+            list_id=expense.list_id,
+            page=page,
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(message, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_amount:"))
+async def callback_expense_manage_amount(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_manage_amount:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        shopping_list, expense = await _get_editable_manual_expense(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+        )
+        await state.set_state(ShoppingListStates.editing_expense_amount)
+        await state.update_data(
+            expense_id=expense.id,
+            expense_page=page,
+            cancel_return="expense_management_detail",
+            cancel_list_id=shopping_list.id,
+            cancel_expense_id=expense.id,
+            cancel_expense_page=page,
+        )
+        await _send_or_edit(
+            query,
+            (
+                f"Новая сумма для траты «{escape(expense.title)}»? "
+                f"Сейчас {shopping.format_money_amount(expense.amount, shopping_list.currency)}."
+            ),
+            reply_markup=cancel_keyboard(),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.message(ShoppingListStates.editing_expense_amount)
+async def state_edit_expense_amount(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, message.from_user)
+    data = await state.get_data()
+    expense_id = int(data.get("expense_id", 0))
+    page = int(data.get("expense_page", 0))
+    try:
+        expense = await shopping.update_expense_amount(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+            amount=message.text or "",
+        )
+        await _finish_expense_update(
+            message,
+            state,
+            bot,
+            session,
+            user_id=user_id,
+            expense_id=expense.id,
+            list_id=expense.list_id,
+            page=page,
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(message, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_category:"))
+async def callback_expense_manage_category(
+    query: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_manage_category:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        shopping_list, expense = await _get_editable_manual_expense(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+        )
+        _, categories, _ = await shopping.get_expense_categories(
+            session,
+            user_id=user_id,
+            list_id=shopping_list.id,
+        )
+        await _send_or_edit(
+            query,
+            f"Выбери категорию для траты «{escape(expense.title)}».",
+            reply_markup=expense_management_category_keyboard(
+                expense,
+                categories,
+                page=page,
+            ),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_category_set:"))
+async def callback_expense_manage_category_set(
+    query: CallbackQuery,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_three_ids(query.data, "expense_manage_category_set:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, category_id, page = parsed
+    try:
+        expense = await shopping.update_expense_category(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+            category_id=category_id,
+        )
+        await _finish_expense_update(
+            query,
+            None,
+            bot,
+            session,
+            user_id=user_id,
+            expense_id=expense.id,
+            list_id=expense.list_id,
+            page=page,
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_category_none:"))
+async def callback_expense_manage_category_none(
+    query: CallbackQuery,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_manage_category_none:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        expense = await shopping.update_expense_category(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+            category_id=None,
+        )
+        await _finish_expense_update(
+            query,
+            None,
+            bot,
+            session,
+            user_id=user_id,
+            expense_id=expense.id,
+            list_id=expense.list_id,
+            page=page,
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_payment:"))
+async def callback_expense_manage_payment(
+    query: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_manage_payment:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        _, expense = await _get_editable_manual_expense(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+        )
+        await _send_or_edit(
+            query,
+            f"Откуда оплатили трату «{escape(expense.title)}»?",
+            reply_markup=expense_management_payment_keyboard(expense.id, page=page),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_source:"))
+async def callback_expense_manage_source(
+    query: CallbackQuery,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_expense_source(query.data, "expense_manage_source:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, source, page = parsed
+    if source not in {shopping.EXPENSE_SOURCE_CASHBOX, shopping.EXPENSE_SOURCE_PERSONAL}:
+        await _answer_callback(query, "Не понял источник оплаты.", show_alert=True)
+        return
+    try:
+        shopping_list, expense = await _get_editable_manual_expense(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+        )
+        if source == shopping.EXPENSE_SOURCE_PERSONAL:
+            _, participants, _ = await shopping.get_list_participants(
+                session,
+                user_id=user_id,
+                list_id=shopping_list.id,
+            )
+            await _send_or_edit(
+                query,
+                "Кто оплатил из своего кармана?",
+                reply_markup=expense_management_payer_keyboard(
+                    expense.id,
+                    participants,
+                    page=page,
+                ),
+            )
+            return
+        expense = await shopping.update_expense_payment(
+            session,
+            user_id=user_id,
+            expense_id=expense.id,
+            source=source,
+        )
+        await _finish_expense_update(
+            query,
+            None,
+            bot,
+            session,
+            user_id=user_id,
+            expense_id=expense.id,
+            list_id=expense.list_id,
+            page=page,
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_payer:"))
+async def callback_expense_manage_payer(
+    query: CallbackQuery,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_three_ids(query.data, "expense_manage_payer:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, payer_id, page = parsed
+    try:
+        expense = await shopping.update_expense_payment(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+            source=shopping.EXPENSE_SOURCE_PERSONAL,
+            payer_id=payer_id,
+        )
+        await _finish_expense_update(
+            query,
+            None,
+            bot,
+            session,
+            user_id=user_id,
+            expense_id=expense.id,
+            list_id=expense.list_id,
+            page=page,
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_shares:"))
+async def callback_expense_manage_shares(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_manage_shares:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    try:
+        shopping_list, expense = await _get_editable_manual_expense(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+        )
+        _, participants, _ = await shopping.get_list_participants(
+            session,
+            user_id=user_id,
+            list_id=shopping_list.id,
+        )
+        selected_user_ids = [share.user_id for share in expense.shares]
+        await state.set_state(ShoppingListStates.editing_expense_shares)
+        await state.update_data(
+            expense_id=expense.id,
+            expense_page=page,
+            selected_user_ids=selected_user_ids,
+            cancel_return="expense_management_detail",
+            cancel_list_id=shopping_list.id,
+            cancel_expense_id=expense.id,
+            cancel_expense_page=page,
+        )
+        await _send_or_edit(
+            query,
+            "Кто участвует в этой трате?",
+            reply_markup=expense_management_participants_keyboard(
+                expense.id,
+                participants,
+                selected_user_ids,
+                page=page,
+            ),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_share_toggle:"))
+async def callback_expense_manage_share_toggle(
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_three_ids(query.data, "expense_manage_share_toggle:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, selected_user_id, page = parsed
+    data = await state.get_data()
+    if int(data.get("expense_id", 0)) != expense_id:
+        await _answer_callback(query, "Редактирование устарело. Открой трату заново.", show_alert=True)
+        return
+    try:
+        shopping_list, expense = await _get_editable_manual_expense(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+        )
+        _, participants, _ = await shopping.get_list_participants(
+            session,
+            user_id=user_id,
+            list_id=shopping_list.id,
+        )
+        participant_ids = {participant.id for participant in participants}
+        if selected_user_id not in participant_ids:
+            raise ValidationError("Можно выбрать только участника тусовки.")
+        selected_user_ids = set(int(value) for value in data.get("selected_user_ids", []))
+        if selected_user_id in selected_user_ids:
+            selected_user_ids.remove(selected_user_id)
+        else:
+            selected_user_ids.add(selected_user_id)
+        selected = sorted(selected_user_ids)
+        await state.update_data(selected_user_ids=selected)
+        await _send_or_edit(
+            query,
+            "Кто участвует в этой трате?",
+            reply_markup=expense_management_participants_keyboard(
+                expense.id,
+                participants,
+                selected,
+                page=page,
+            ),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("expense_manage_share_done:"))
+async def callback_expense_manage_share_done(
+    query: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    session: AsyncSession,
+) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parsed = _parse_two_ids(query.data, "expense_manage_share_done:")
+    if parsed is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    expense_id, page = parsed
+    data = await state.get_data()
+    if int(data.get("expense_id", 0)) != expense_id:
+        await _answer_callback(query, "Редактирование устарело. Открой трату заново.", show_alert=True)
+        return
+    selected_user_ids = [int(value) for value in data.get("selected_user_ids", [])]
+    try:
+        expense = await shopping.update_expense_shares(
+            session,
+            user_id=user_id,
+            expense_id=expense_id,
+            share_user_ids=selected_user_ids,
+        )
+        await _finish_expense_update(
+            query,
+            state,
+            bot,
+            session,
+            user_id=user_id,
+            expense_id=expense.id,
+            list_id=expense.list_id,
+            page=page,
+        )
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 

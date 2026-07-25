@@ -7,7 +7,11 @@ from app.tgbot.keyboards import (
     expense_category_keyboard,
     expense_category_split_keyboard,
     expense_delete_confirm_keyboard,
-    expense_deletion_keyboard,
+    expense_management_category_keyboard,
+    expense_management_detail_keyboard,
+    expense_management_keyboard,
+    expense_management_participants_keyboard,
+    expense_management_payment_keyboard,
     expense_source_keyboard,
     expense_split_keyboard,
     item_purchase_source_keyboard,
@@ -66,10 +70,13 @@ def test_money_keyboard_has_party_money_actions():
     assert any(button.text == "Трата" and button.callback_data == "expense:1" for button in buttons)
     assert any(button.text == "Категории трат" and button.callback_data == "categories:1" for button in buttons)
     assert any(button.text == "Итог" and button.callback_data == "money_final:1" for button in buttons)
-    assert any(button.text == "Удалить трату" and button.callback_data == "expense_delete_list:1" for button in buttons)
+    assert any(
+        button.text == "Управление тратами" and button.callback_data == "expense_manage_list:1"
+        for button in buttons
+    )
 
 
-def test_expense_deletion_keyboard_paginates_and_confirms():
+def test_expense_management_keyboard_paginates_opens_and_confirms():
     shopping_list = ShoppingList(id=1, owner_id=100, title="Дом", currency="BYN")
     expenses = [
         Expense(
@@ -83,20 +90,99 @@ def test_expense_deletion_keyboard_paginates_and_confirms():
         for index in range(1, 10)
     ]
 
-    first_page = expense_deletion_keyboard(shopping_list, expenses, page=0)
+    first_page = expense_management_keyboard(shopping_list, expenses, page=0)
     first_page_buttons = [button for row in first_page.inline_keyboard for button in row]
-    assert sum(button.callback_data.startswith("expense_delete_confirm:") for button in first_page_buttons) == 8
-    assert any(button.callback_data == "expense_delete_page:1:1" for button in first_page_buttons)
+    assert sum(button.callback_data.startswith("expense_manage_open:") for button in first_page_buttons) == 8
+    assert any(button.callback_data == "expense_manage_page:1:1" for button in first_page_buttons)
 
-    second_page = expense_deletion_keyboard(shopping_list, expenses, page=1)
+    second_page = expense_management_keyboard(shopping_list, expenses, page=1)
     second_page_buttons = [button for row in second_page.inline_keyboard for button in row]
-    assert sum(button.callback_data.startswith("expense_delete_confirm:") for button in second_page_buttons) == 1
-    assert any(button.callback_data == "expense_delete_page:1:0" for button in second_page_buttons)
+    assert sum(button.callback_data.startswith("expense_manage_open:") for button in second_page_buttons) == 1
+    assert any(button.callback_data == "expense_manage_page:1:0" for button in second_page_buttons)
 
     confirmation = expense_delete_confirm_keyboard(expense_id=9, list_id=1, page=1)
     confirmation_buttons = [button for row in confirmation.inline_keyboard for button in row]
     assert any(button.text == "Да, удалить" and button.callback_data == "expense_delete_apply:9:1" for button in confirmation_buttons)
-    assert any(button.text == "Нет, назад" and button.callback_data == "expense_delete_page:1:1" for button in confirmation_buttons)
+    assert any(button.text == "Нет, назад" and button.callback_data == "expense_manage_open:9:1" for button in confirmation_buttons)
+
+
+def test_expense_management_detail_limits_actions_by_type_and_permissions():
+    manual = Expense(
+        id=9,
+        list_id=1,
+        title="Марша",
+        amount=600,
+        payer_id=100,
+        source="cashbox",
+    )
+    editable = expense_management_detail_keyboard(
+        manual,
+        list_id=1,
+        page=0,
+        can_manage=True,
+        is_manual=True,
+    )
+    editable_buttons = [button for row in editable.inline_keyboard for button in row]
+    assert any(button.callback_data == "expense_manage_title:9:0" for button in editable_buttons)
+    assert any(button.callback_data == "expense_manage_amount:9:0" for button in editable_buttons)
+    assert any(button.callback_data == "expense_manage_category:9:0" for button in editable_buttons)
+    assert any(button.callback_data == "expense_manage_payment:9:0" for button in editable_buttons)
+    assert any(button.callback_data == "expense_manage_shares:9:0" for button in editable_buttons)
+    assert any(button.callback_data == "expense_delete_confirm:9:0" for button in editable_buttons)
+
+    linked = expense_management_detail_keyboard(
+        manual,
+        list_id=1,
+        page=0,
+        can_manage=True,
+        is_manual=False,
+    )
+    linked_buttons = [button for row in linked.inline_keyboard for button in row]
+    assert not any(button.callback_data.startswith("expense_manage_title:") for button in linked_buttons)
+    assert any(button.callback_data == "expense_delete_confirm:9:0" for button in linked_buttons)
+
+    read_only = expense_management_detail_keyboard(
+        manual,
+        list_id=1,
+        page=0,
+        can_manage=False,
+        is_manual=True,
+    )
+    read_only_buttons = [button for row in read_only.inline_keyboard for button in row]
+    assert not any(button.callback_data.startswith("expense_delete_confirm:") for button in read_only_buttons)
+
+
+def test_expense_management_edit_keyboards_have_cancel_and_done_actions():
+    expense = Expense(
+        id=9,
+        list_id=1,
+        title="Марша",
+        amount=600,
+        payer_id=100,
+        source="cashbox",
+        category_id=None,
+    )
+    category = ExpenseCategory(id=10, list_id=1, title="Транспорт", default_split="selected", position=1)
+    categories = expense_management_category_keyboard(expense, [category], page=2)
+    category_buttons = [button for row in categories.inline_keyboard for button in row]
+    assert any(button.callback_data == "expense_manage_category_set:9:10:2" for button in category_buttons)
+    assert any(button.callback_data == "expense_manage_category_none:9:2" for button in category_buttons)
+    assert any(button.callback_data == "expense_manage_open:9:2" for button in category_buttons)
+
+    payment = expense_management_payment_keyboard(expense.id, page=2)
+    payment_buttons = [button for row in payment.inline_keyboard for button in row]
+    assert any(button.callback_data == "expense_manage_source:9:cashbox:2" for button in payment_buttons)
+    assert any(button.callback_data == "expense_manage_source:9:personal:2" for button in payment_buttons)
+
+    participants = [
+        User(id=100, username="owner", first_name="Owner"),
+        User(id=200, username="author", first_name="Author"),
+    ]
+    split = expense_management_participants_keyboard(expense.id, participants, [200], page=2)
+    split_buttons = [button for row in split.inline_keyboard for button in row]
+    assert any(button.callback_data == "expense_manage_share_toggle:9:100:2" for button in split_buttons)
+    assert any(button.text.startswith("✓") and button.callback_data == "expense_manage_share_toggle:9:200:2" for button in split_buttons)
+    assert any(button.callback_data == "expense_manage_share_done:9:2" for button in split_buttons)
 
 
 def test_payment_source_and_payer_keyboards():
@@ -169,6 +255,7 @@ def test_expense_categories_keyboard_has_category_custom_and_add_actions():
     assert any(button.text == "Маршрутка" and button.callback_data == "expense_category:10" for button in buttons)
     assert any(button.text == "Разовая трата без категории" and button.callback_data == "expense_custom:1" for button in buttons)
     assert any(button.text == "Добавить категорию" and button.callback_data == "category_add:1" for button in buttons)
+    assert any(button.text == "Управление тратами" and button.callback_data == "expense_manage_list:1" for button in buttons)
 
 
 def test_expense_category_keyboard_has_expense_settings_and_rename_actions():

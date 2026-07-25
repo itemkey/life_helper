@@ -28,6 +28,15 @@ from app.tgbot.handlers import (
     callback_expense_delete_apply,
     callback_expense_delete_confirm,
     callback_expense_delete_list,
+    callback_expense_manage_amount,
+    callback_expense_manage_category_set,
+    callback_expense_manage_open,
+    callback_expense_manage_payer,
+    callback_expense_manage_share_done,
+    callback_expense_manage_share_toggle,
+    callback_expense_manage_shares,
+    callback_expense_manage_source,
+    callback_expense_manage_title,
     callback_expense_payer_other,
     callback_expense_payer_select,
     callback_expense_payer_self,
@@ -56,6 +65,8 @@ from app.tgbot.handlers import (
     state_category_title,
     state_contribution_amount,
     state_expense_amount,
+    state_edit_expense_title,
+    state_edit_expense_amount,
     state_receipt_amount,
     state_shopping_category_title,
 )
@@ -1016,9 +1027,23 @@ async def test_old_uncategorized_expense_can_be_deleted_from_money_screen(sessio
     buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
     assert any(
         button.text == "Маршрутка — 12.00 BYN"
-        and button.callback_data == f"expense_delete_confirm:{expense.id}:0"
+        and button.callback_data == f"expense_manage_open:{expense.id}:0"
         for button in buttons
     )
+
+    await callback_expense_manage_open(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"expense_manage_open:{expense.id}:0",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    assert "Трата: Маршрутка" in query_message.edits[-1][0]
+    detail_buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
+    assert any(button.callback_data == f"expense_manage_title:{expense.id}:0" for button in detail_buttons)
+    assert any(button.callback_data == f"expense_delete_confirm:{expense.id}:0" for button in detail_buttons)
 
     await callback_expense_delete_confirm(
         FakeCallback(
@@ -1044,6 +1069,222 @@ async def test_old_uncategorized_expense_can_be_deleted_from_money_screen(sessio
     assert summary.expenses == []
     assert summary.cashbox_balance == 0
     assert "Трат пока нет" in query_message.edits[-1][0]
+
+
+async def test_expense_management_detail_is_read_only_for_other_member(session):
+    for user_id in (100, 200, 300):
+        await shopping.upsert_user(session, FakeTelegramUser(id=user_id))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    await shopping.join_public_list_by_token(session, user_id=300, token=token)
+    expense = await shopping.create_expense(
+        session,
+        user_id=200,
+        list_id=shopping_list.id,
+        title="Марша",
+        amount="6",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[200],
+    )
+    state = FakeState()
+    query_message = FakeEditableMessage(chat=FakeChat(3000), message_id=30)
+
+    await callback_expense_manage_open(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=300),
+            data=f"expense_manage_open:{expense.id}:0",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+
+    assert "только её автор или владелец тусовки" in query_message.edits[-1][0]
+    buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
+    assert not any(button.callback_data.startswith("expense_manage_title:") for button in buttons)
+    assert not any(button.callback_data.startswith("expense_delete_confirm:") for button in buttons)
+
+    forged_query = FakeCallback(
+        from_user=FakeTelegramUser(id=300),
+        data=f"expense_delete_confirm:{expense.id}:0",
+        message=query_message,
+    )
+    await callback_expense_delete_confirm(forged_query, session)
+    assert forged_query.answers[-1] == (
+        "Изменять и удалять трату может только её автор или владелец тусовки.",
+        True,
+    )
+
+
+async def test_expense_author_can_edit_title_and_cancel_without_changes(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    expense = await shopping.create_expense(
+        session,
+        user_id=200,
+        list_id=shopping_list.id,
+        title="Марша",
+        amount="6",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[200],
+    )
+    state = FakeState()
+    query_message = FakeEditableMessage(chat=FakeChat(2000), message_id=20)
+
+    await callback_expense_manage_title(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200),
+            data=f"expense_manage_title:{expense.id}:2",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    assert state.data["state"] == ShoppingListStates.editing_expense_title
+    assert "Новое название" in query_message.edits[-1][0]
+
+    await state_edit_expense_title(
+        FakeMessage(from_user=FakeTelegramUser(id=200), text="Маршрутка"),
+        state,
+        FakeBot(),
+        session,
+    )
+    assert expense.title == "Маршрутка"
+    assert state.cleared is True
+
+    state = FakeState()
+    await callback_expense_manage_title(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200),
+            data=f"expense_manage_title:{expense.id}:2",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    await callback_cancel(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200),
+            data="cancel",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    assert expense.title == "Маршрутка"
+    assert "Трата: Маршрутка" in query_message.edits[-1][0]
+
+
+async def test_expense_inline_edits_update_category_payment_shares_and_amount(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100, first_name="Owner"))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, first_name="Author"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    category = await shopping.create_expense_category(
+        session,
+        user_id=100,
+        list_id=shopping_list.id,
+        title="Транспорт",
+    )
+    expense = await shopping.create_expense(
+        session,
+        user_id=200,
+        list_id=shopping_list.id,
+        title="Марша",
+        amount="6",
+        source=shopping.EXPENSE_SOURCE_CASHBOX,
+        share_user_ids=[200],
+    )
+    bot = FakeBot()
+    query_message = FakeEditableMessage(chat=FakeChat(2000), message_id=20)
+
+    await callback_expense_manage_category_set(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, first_name="Author"),
+            data=f"expense_manage_category_set:{expense.id}:{category.id}:0",
+            message=query_message,
+        ),
+        bot,
+        session,
+    )
+    assert "Категория: Транспорт" in query_message.edits[-1][0]
+
+    await callback_expense_manage_source(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, first_name="Author"),
+            data=f"expense_manage_source:{expense.id}:personal:0",
+            message=query_message,
+        ),
+        bot,
+        session,
+    )
+    assert "Кто оплатил" in query_message.edits[-1][0]
+
+    await callback_expense_manage_payer(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, first_name="Author"),
+            data=f"expense_manage_payer:{expense.id}:100:0",
+            message=query_message,
+        ),
+        bot,
+        session,
+    )
+    assert "Оплата: из кармана — Owner" in query_message.edits[-1][0]
+
+    state = FakeState()
+    await callback_expense_manage_shares(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, first_name="Author"),
+            data=f"expense_manage_shares:{expense.id}:0",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    await callback_expense_manage_share_toggle(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, first_name="Author"),
+            data=f"expense_manage_share_toggle:{expense.id}:100:0",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    await callback_expense_manage_share_done(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, first_name="Author"),
+            data=f"expense_manage_share_done:{expense.id}:0",
+            message=query_message,
+        ),
+        state,
+        bot,
+        session,
+    )
+    assert "Owner (3.00 BYN), Author (3.00 BYN)" in query_message.edits[-1][0]
+
+    state = FakeState()
+    await callback_expense_manage_amount(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=200, first_name="Author"),
+            data=f"expense_manage_amount:{expense.id}:0",
+            message=query_message,
+        ),
+        state,
+        session,
+    )
+    await state_edit_expense_amount(
+        FakeMessage(from_user=FakeTelegramUser(id=200, first_name="Author"), text="7"),
+        state,
+        bot,
+        session,
+    )
+    assert expense.amount == 700
+    assert [share.amount for share in expense.shares] == [350, 350]
 
 
 async def test_expense_category_default_all_flow_has_fast_default_button(session):
