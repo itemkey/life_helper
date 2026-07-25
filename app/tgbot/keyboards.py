@@ -126,7 +126,7 @@ def shopping_categories_keyboard(
             InlineKeyboardButton(text="Добавить личную", callback_data=f"shopping_category_add_personal:{shopping_list.id}"),
         ]
     )
-    rows.append([InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=f"open:{shopping_list.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -197,7 +197,7 @@ def shopping_category_select_keyboard(
         for category in categories
     ]
     rows.append([InlineKeyboardButton(text="Категории списков", callback_data=f"shopping_categories:{shopping_list.id}")])
-    rows.append([InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=f"open:{shopping_list.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -283,7 +283,7 @@ def money_keyboard(shopping_list: ShoppingList, *, has_expenses: bool = False) -
         rows.append(
             [InlineKeyboardButton(text="Удалить трату", callback_data=f"expense_delete_list:{shopping_list.id}")]
         )
-    rows.append([InlineKeyboardButton(text="Назад к тусовке", callback_data=f"open:{shopping_list.id}")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=f"open:{shopping_list.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
