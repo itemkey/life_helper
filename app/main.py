@@ -47,8 +47,8 @@ async def main() -> None:
         [
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="help", description="Помощь"),
-            BotCommand(command="lists", description="Мои тусовки"),
-            BotCommand(command="new", description="Создать тусовку"),
+            BotCommand(command="lists", description="Все списки"),
+            BotCommand(command="new", description="Создать список"),
             BotCommand(command="cancel", description="Отменить ввод"),
         ]
     )

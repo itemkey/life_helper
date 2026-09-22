@@ -325,7 +325,7 @@ async def test_shopping_category_delete_rejects_non_empty_category(session):
     )
     await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Сок", category_id=category.id)
 
-    with pytest.raises(ValidationError, match="Сначала удали элементы"):
+    with pytest.raises(ValidationError, match="Сначала удали все пункты"):
         await shopping.delete_shopping_category(session, user_id=100, category_id=category.id)
 
 
@@ -336,10 +336,10 @@ async def test_shopping_category_delete_rejects_last_required_categories(session
     common_category = next(category for category in categories if category.scope == shopping.ITEM_SCOPE_COMMON)
     personal_category = next(category for category in categories if category.scope == shopping.ITEM_SCOPE_PERSONAL)
 
-    with pytest.raises(ValidationError, match="последнюю общую"):
+    with pytest.raises(ValidationError, match="последний общий"):
         await shopping.delete_shopping_category(session, user_id=100, category_id=common_category.id)
 
-    with pytest.raises(ValidationError, match="единственную личную"):
+    with pytest.raises(ValidationError, match="единственный личный"):
         await shopping.delete_shopping_category(session, user_id=100, category_id=personal_category.id)
 
 
@@ -524,7 +524,7 @@ async def test_member_can_pay_for_another_users_personal_item_from_that_users_po
     assert [(share.user_id, share.amount) for share in expense.shares] == [(100, 800)]
     assert {balance.user.id: balance.balance for balance in summary.balances} == {100: 0, 200: 0}
 
-    with pytest.raises(ValidationError, match="участником тусовки"):
+    with pytest.raises(ValidationError, match="участником списка"):
         await shopping.create_expense(
             session,
             user_id=200,

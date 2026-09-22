@@ -212,7 +212,7 @@ async def _get_participant_users(session: AsyncSession, shopping_list: ShoppingL
 
 def _validate_shopping_category_scope(scope: str) -> None:
     if scope not in {ITEM_SCOPE_COMMON, ITEM_SCOPE_PERSONAL}:
-        raise ValidationError("Не понял, это общая или личная категория списка.")
+        raise ValidationError("Выбери общий или личный раздел.")
 
 
 def _validate_shopping_category_mode(accounting_mode: str) -> None:
@@ -221,7 +221,7 @@ def _validate_shopping_category_mode(accounting_mode: str) -> None:
         SHOPPING_CATEGORY_MODE_RECEIPT,
         SHOPPING_CATEGORY_MODE_CHECKLIST,
     }:
-        raise ValidationError("Не понял режим категории списка.")
+        raise ValidationError("Выбери тип раздела: покупки или вещи.")
 
 
 async def _shopping_category_title_exists(
@@ -340,7 +340,7 @@ def _ensure_shopping_category_edit_allowed(
         return
     if category.scope == ITEM_SCOPE_PERSONAL and category.owner_id == user_id:
         return
-    raise AccessDenied("Эту категорию списка может менять только владелец тусовки или владелец личной категории.")
+    raise AccessDenied("Этот раздел может менять только владелец списка или владелец личного раздела.")
 
 
 def _ensure_shopping_category_add_allowed(
@@ -353,7 +353,7 @@ def _ensure_shopping_category_add_allowed(
         return
     if level == AccessLevel.owner or category.owner_id == user_id:
         return
-    raise AccessDenied("В чужую личную категорию можно смотреть, но нельзя добавлять элементы.")
+    raise AccessDenied("В чужой личный раздел нельзя добавлять пункты.")
 
 
 async def get_list_participants(
@@ -400,7 +400,7 @@ async def create_expense_category(
         )
     ).all()
     if normalized_title.casefold() in {existing.casefold() for existing in existing_titles}:
-        raise ValidationError("Такая категория уже есть в этой тусовке.")
+        raise ValidationError("Раздел с таким названием уже есть в этом списке.")
 
     max_position = await session.scalar(
         select(func.coalesce(func.max(ExpenseCategory.position), 0)).where(
@@ -450,7 +450,7 @@ async def rename_expense_category(
         )
     ).all()
     if normalized_title.casefold() in {existing.casefold() for existing in existing_titles}:
-        raise ValidationError("Такая категория уже есть в этой тусовке.")
+        raise ValidationError("Раздел с таким названием уже есть в этом списке.")
     category.title = normalized_title
     await session.flush()
     return category
@@ -539,7 +539,7 @@ def _ensure_expense_management_allowed(
 ) -> None:
     if can_manage_expense(shopping_list, expense, user_id=user_id):
         return
-    raise AccessDenied("Изменять и удалять трату может только её автор или владелец тусовки.")
+    raise AccessDenied("Изменять и удалять трату может только её автор или владелец списка.")
 
 
 def _ensure_manual_expense(expense: Expense) -> None:
@@ -614,7 +614,7 @@ async def update_expense_category(
     if category_id is not None:
         category = await session.get(ExpenseCategory, category_id)
         if category is None or category.list_id != shopping_list.id:
-            raise ValidationError("Категория должна принадлежать этой тусовке.")
+            raise ValidationError("Категория должна принадлежать этому списку.")
     expense.category_id = category.id if category is not None else None
     expense.category = category
     await session.flush()
@@ -643,7 +643,7 @@ async def update_expense_payment(
         participants = await _get_participant_users(session, shopping_list)
         payer = next((participant for participant in participants if participant.id == payer_id), None)
         if payer is None:
-            raise ValidationError("Плательщик должен быть участником тусовки.")
+            raise ValidationError("Плательщик должен быть участником списка.")
         expense.payer_id = payer_id
         expense.payer = payer
     expense.source = source
@@ -668,7 +668,7 @@ async def update_expense_shares(
     requested_user_ids = list(dict.fromkeys(share_user_ids))
     requested_user_id_set = set(requested_user_ids)
     if any(selected_user_id not in participants_by_id for selected_user_id in requested_user_id_set):
-        raise ValidationError("Можно распределять траты только между участниками тусовки.")
+        raise ValidationError("Можно распределять траты только между участниками списка.")
     selected_user_ids = [
         participant.id
         for participant in participants
@@ -803,10 +803,10 @@ async def create_shopping_category(
     else:
         owner_id = owner_id or user_id
         if owner_id != user_id and level != AccessLevel.owner:
-            raise AccessDenied("Создать личную категорию для другого участника может только владелец тусовки.")
+            raise AccessDenied("Создать личный раздел для другого участника может только владелец списка.")
         participant_ids = await _participant_user_ids(session, shopping_list)
         if owner_id not in participant_ids:
-            raise ValidationError("Личная категория должна принадлежать участнику тусовки.")
+            raise ValidationError("Личный раздел должен принадлежать участнику списка.")
 
     if await _shopping_category_title_exists(
         session,
@@ -883,7 +883,7 @@ async def delete_shopping_category(
         select(func.count()).select_from(ShoppingItem).where(ShoppingItem.category_id == category.id)
     )
     if int(item_count or 0) > 0:
-        raise ValidationError("Сначала удали элементы из этой категории списка.")
+        raise ValidationError("Сначала удали все пункты из этого раздела.")
 
     if category.scope == ITEM_SCOPE_COMMON:
         category_count = await session.scalar(
@@ -895,7 +895,7 @@ async def delete_shopping_category(
             )
         )
         if int(category_count or 0) <= 1:
-            raise ValidationError("Нельзя удалить последнюю общую категорию списка.")
+            raise ValidationError("Нельзя удалить последний общий раздел списка.")
     else:
         category_count = await session.scalar(
             select(func.count())
@@ -907,7 +907,7 @@ async def delete_shopping_category(
             )
         )
         if int(category_count or 0) <= 1:
-            raise ValidationError("Нельзя удалить единственную личную категорию участника.")
+            raise ValidationError("Нельзя удалить единственный личный раздел участника.")
 
     list_id = shopping_list.id
     await session.delete(category)
@@ -932,7 +932,7 @@ async def _normalize_share_user_ids(
     requested = set(share_user_ids)
     selected = [user_id for user_id in participant_ids if user_id in requested]
     if len(selected) != len(requested):
-        raise ValidationError("Можно распределять траты только между участниками тусовки.")
+        raise ValidationError("Можно распределять траты только между участниками списка.")
     return selected
 
 
@@ -1108,7 +1108,7 @@ async def add_items(
     if category_id is not None:
         _, category, _ = await get_shopping_category(session, user_id=user_id, category_id=category_id)
         if category.list_id != shopping_list.id:
-            raise ValidationError("Категория списка должна принадлежать этой тусовке.")
+            raise ValidationError("Раздел должен принадлежать этому списку.")
         _ensure_shopping_category_add_allowed(category=category, user_id=user_id, level=level)
     else:
         await _ensure_default_shopping_categories(session, shopping_list)
@@ -1180,7 +1180,7 @@ def _ensure_item_edit_allowed(
         return
     if level == AccessLevel.owner or item.personal_owner_id == user_id:
         return
-    raise AccessDenied("В чужой личный список можно смотреть, но нельзя удалять или редактировать.")
+    raise AccessDenied("Чужой личный раздел можно смотреть, но нельзя менять.")
 
 
 async def toggle_item(
@@ -1267,11 +1267,11 @@ async def create_contribution(
     shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
     contributor_id = contributor_id or user_id
     if contributor_id != user_id and level != AccessLevel.owner:
-        raise AccessDenied("Записать взнос за другого участника может только владелец тусовки.")
+        raise AccessDenied("Записать взнос за другого участника может только владелец списка.")
 
     participant_ids = await _participant_user_ids(session, shopping_list)
     if contributor_id not in participant_ids:
-        raise ValidationError("Взнос можно записать только за участника тусовки.")
+        raise ValidationError("Взнос можно записать только за участника списка.")
 
     normalized_note = " ".join(note.strip().split()) if note else None
     contribution = Contribution(
@@ -1305,17 +1305,17 @@ async def create_expense(
     if source not in {EXPENSE_SOURCE_CASHBOX, EXPENSE_SOURCE_PERSONAL}:
         raise ValidationError("Не понял источник оплаты.")
     if payer_id != user_id and source != EXPENSE_SOURCE_PERSONAL and level != AccessLevel.owner:
-        raise AccessDenied("Записать оплату за другого участника может только владелец тусовки.")
+        raise AccessDenied("Записать оплату за другого участника может только владелец списка.")
 
     participant_ids = await _participant_user_ids(session, shopping_list)
     if payer_id not in participant_ids:
-        raise ValidationError("Плательщик должен быть участником тусовки.")
+        raise ValidationError("Плательщик должен быть участником списка.")
 
     category: ExpenseCategory | None = None
     if category_id is not None:
         category = await session.get(ExpenseCategory, category_id)
         if category is None or category.list_id != shopping_list.id:
-            raise ValidationError("Категория должна принадлежать этой тусовке.")
+            raise ValidationError("Категория должна принадлежать этому списку.")
 
     linked_item_ids = list(dict.fromkeys(item_ids or ([] if item_id is None else [item_id])))
     if linked_item_ids:
@@ -1330,7 +1330,7 @@ async def create_expense(
             ).all()
         )
         if existing_item_ids != set(linked_item_ids):
-            raise ValidationError("Все товары расхода должны принадлежать этой тусовке.")
+            raise ValidationError("Все товары должны принадлежать этому списку.")
 
     selected_share_user_ids = await _normalize_share_user_ids(session, shopping_list, share_user_ids)
     amount_minor = parse_money_amount(amount)

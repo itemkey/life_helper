@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from aiogram.filters import CommandObject
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.db.models import ListViewMessage
 from app.services import shopping
 from app.tgbot.states import ShoppingListStates
-from app.tgbot.texts import format_money_text
+from app.tgbot.texts import format_money_final_text, format_money_text
 from app.tgbot.handlers import (
     callback_add_items,
     callback_add_category_items,
@@ -20,6 +21,7 @@ from app.tgbot.handlers import (
     callback_category_add,
     callback_contribution,
     callback_delete_item,
+    callback_delete_item_confirm,
     callback_check_all_items,
     callback_expense_category,
     callback_expense_category_add,
@@ -48,11 +50,15 @@ from app.tgbot.handlers import (
     callback_members,
     callback_members_manage,
     callback_member_ban,
+    callback_member_ban_confirm,
     callback_member_remove,
+    callback_member_remove_confirm,
     callback_receipt,
     callback_receipt_items_done,
     callback_receipt_select,
     callback_refresh_list,
+    callback_private_confirm,
+    callback_relink_confirm,
     callback_shopping_category_add_common,
     callback_shopping_category_delete,
     callback_shopping_category_mode,
@@ -183,6 +189,32 @@ async def test_start_with_invalid_deep_link_shows_error(session):
     assert "Ссылка недействительна" in message.answers[0][0]
 
 
+async def test_existing_list_and_money_survive_opening_in_new_session(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Старый список")
+    items = await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Молоко")
+    await shopping.create_contribution(session, user_id=100, list_id=shopping_list.id, amount="50")
+    await session.commit()
+
+    session_factory = async_sessionmaker(session.bind, expire_on_commit=False)
+    async with session_factory() as reopened_session:
+        query = FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"refresh:{shopping_list.id}",
+            message=FakeEditableMessage(chat=FakeChat(1000), message_id=10),
+        )
+        await callback_refresh_list(query, reopened_session)
+        assert "Старый список" in query.message.edits[-1][0]
+        assert "Молоко" in query.message.edits[-1][0]
+
+        _, reopened_items, _ = await shopping.get_list_view(
+            reopened_session, user_id=100, list_id=shopping_list.id
+        )
+        summary = await shopping.get_money_summary(reopened_session, user_id=100, list_id=shopping_list.id)
+        assert [item.id for item in reopened_items] == [items[0].id]
+        assert summary.cashbox_balance == 5000
+
+
 async def test_refresh_list_edits_message_and_saves_view(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
@@ -247,8 +279,8 @@ async def test_owner_can_open_members_management(session):
     text, keyboard = query.message.edits[0]
     assert "Управление участниками" in text
     buttons = [button for row in keyboard.inline_keyboard for button in row]
-    assert any(button.callback_data == f"member_remove:{shopping_list.id}:200" for button in buttons)
-    assert any(button.callback_data == f"member_ban:{shopping_list.id}:200" for button in buttons)
+    assert any(button.callback_data == f"member_remove_ask:{shopping_list.id}:200" for button in buttons)
+    assert any(button.callback_data == f"member_ban_ask:{shopping_list.id}:200" for button in buttons)
 
 
 async def test_owner_can_remove_member_from_members_management(session):
@@ -287,10 +319,61 @@ async def test_owner_can_ban_member_from_members_management(session):
 
     await callback_member_ban(query, session)
 
-    assert ("Участник забанен.", False) in query.answers
+    assert ("Участник заблокирован.", False) in query.answers
     assert query.message is not None
     assert "Участников по ссылке пока нет." in query.message.edits[-1][0]
     assert await shopping.join_public_list_by_token(session, user_id=200, token=token) is None
+
+
+async def test_member_actions_show_consequences_before_changing_access(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200, first_name="Иван"))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_member_remove_confirm(
+        FakeCallback(from_user=FakeTelegramUser(id=100), data=f"member_remove_ask:{shopping_list.id}:200", message=query_message),
+        session,
+    )
+    assert "Удалить Иван" in query_message.edits[-1][0]
+    assert "взносы" in query_message.edits[-1][0]
+    buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
+    assert any(button.callback_data == f"member_remove:{shopping_list.id}:200" for button in buttons)
+
+    await callback_member_ban_confirm(
+        FakeCallback(from_user=FakeTelegramUser(id=100), data=f"member_ban_ask:{shopping_list.id}:200", message=query_message),
+        session,
+    )
+    assert "Заблокировать Иван" in query_message.edits[-1][0]
+    assert "не сможет снова войти" in query_message.edits[-1][0]
+    _, _, members, _ = await shopping.get_list_members_view(session, user_id=100, list_id=shopping_list.id)
+    assert len(members) == 1
+
+
+async def test_access_changes_require_confirmation(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_relink_confirm(
+        FakeCallback(from_user=FakeTelegramUser(id=100), data=f"relink_ask:{shopping_list.id}", message=query_message),
+        session,
+    )
+    assert "Старая ссылка перестанет работать" in query_message.edits[-1][0]
+    buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
+    assert any(button.callback_data == f"relink:{shopping_list.id}" for button in buttons)
+
+    await callback_private_confirm(
+        FakeCallback(from_user=FakeTelegramUser(id=100), data=f"private_ask:{shopping_list.id}", message=query_message),
+        session,
+    )
+    assert "взносы" in query_message.edits[-1][0]
+    buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
+    assert any(button.callback_data == f"private:{shopping_list.id}" for button in buttons)
+    assert (await session.get(type(shopping_list), shopping_list.id)).public_token == token
 
 
 async def test_add_items_broadcasts_public_list_update_to_other_viewers(session):
@@ -391,7 +474,7 @@ async def test_toggle_and_delete_broadcast_public_list_updates_to_other_viewers(
     )
 
     assert len(bot.edits) == 1
-    assert "Тусовка пока пустая" in str(bot.edits[0]["text"])
+    assert "Здесь пока пусто" in str(bot.edits[0]["text"])
 
 
 async def test_member_can_choose_personal_item_owner_as_payer(session):
@@ -476,7 +559,7 @@ async def test_member_can_choose_personal_item_owner_as_payer(session):
     assert [(share.user_id, share.amount) for share in expense.shares] == [(100, 800)]
     assert (
         "2 энергетика Burn классических: 8.00 BYN "
-        "(из своих, платил Артём (@artem), долей: 1)"
+        "(из кармана, платил Артём (@artem), участников: 1)"
     ) in format_money_text(summary)
 
 
@@ -601,7 +684,20 @@ async def test_cancel_from_add_items_returns_to_list(session):
     assert state.cleared is True
     assert query_message.edits
     assert "Пикник" in query_message.edits[-1][0]
-    assert "Тусовка пока пустая" in query_message.edits[-1][0]
+    assert "Здесь пока пусто" in query_message.edits[-1][0]
+
+
+async def test_final_money_text_explains_cashbox_without_false_all_clear(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    await shopping.create_contribution(session, user_id=100, list_id=shopping_list.id, amount="50")
+
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    result = format_money_final_text(summary)
+
+    assert "получить 50.00 BYN" in result
+    assert "Переводов между участниками нет" in result
+    assert "Остаток кассы учтите отдельно" in result
 
 
 async def test_cancel_from_contribution_returns_to_money(session):
@@ -632,7 +728,7 @@ async def test_cancel_from_contribution_returns_to_money(session):
     assert state.cleared is True
     assert query_message.edits
     assert "Деньги: Пикник" in query_message.edits[-1][0]
-    assert "Остаток кассы" in query_message.edits[-1][0]
+    assert "В кассе сейчас" in query_message.edits[-1][0]
 
 
 async def test_add_button_shows_shopping_categories(session):
@@ -652,9 +748,54 @@ async def test_add_button_shows_shopping_categories(session):
     )
 
     assert query_message.edits
-    assert "Выбери категорию списка" in query_message.edits[-1][0]
+    assert "Куда добавить?" in query_message.edits[-1][0]
     buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
     assert any(button.callback_data.startswith("add_category:") for button in buttons)
+    assert any(button.callback_data == f"open:{shopping_list.id}" for button in buttons)
+
+
+async def test_delete_button_requires_confirmation_and_returns_to_list(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    items = await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Сок")
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_delete_item_confirm(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"delitem_ask:{items[0].id}",
+            message=query_message,
+        ),
+        session,
+    )
+
+    assert "Удалить «Сок»" in query_message.edits[-1][0]
+    buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
+    assert any(button.callback_data == f"delitem:{items[0].id}" for button in buttons)
+    assert any(button.callback_data == f"open:{shopping_list.id}" for button in buttons)
+    assert (await shopping.get_item_view(session, user_id=100, item_id=items[0].id))[1].text == "Сок"
+
+
+async def test_add_chooser_stops_public_list_updates_overwriting_the_menu(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Пикник")
+    await shopping.save_list_view_message(
+        session, list_id=shopping_list.id, user_id=100, chat_id=1000, message_id=10
+    )
+    query_message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_add_items(
+        FakeCallback(
+            from_user=FakeTelegramUser(id=100),
+            data=f"add:{shopping_list.id}",
+            message=query_message,
+        ),
+        FakeState(),
+        session,
+    )
+
+    assert "Куда добавить?" in query_message.edits[-1][0]
+    assert await session.get(ListViewMessage, (shopping_list.id, 100)) is None
 
 
 async def test_add_category_item_returns_to_same_category_screen(session):
@@ -949,7 +1090,7 @@ async def test_contribution_and_category_expense_flow_updates_money_summary(sess
         session,
     )
     assert done_message.edits
-    assert "Маршрутка: Маршрутка: 30.00 BYN (касса, долей: 1)" in done_message.edits[-1][0]
+    assert "Маршрутка: 30.00 BYN (касса, участников: 1)" in done_message.edits[-1][0]
     assert "платил" not in done_message.edits[-1][0]
 
     summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
@@ -1100,7 +1241,7 @@ async def test_expense_management_detail_is_read_only_for_other_member(session):
         session,
     )
 
-    assert "только её автор или владелец тусовки" in query_message.edits[-1][0]
+    assert "только её автор или владелец списка" in query_message.edits[-1][0]
     buttons = [button for row in query_message.reply_markup.inline_keyboard for button in row]
     assert not any(button.callback_data.startswith("expense_manage_title:") for button in buttons)
     assert not any(button.callback_data.startswith("expense_delete_confirm:") for button in buttons)
@@ -1112,7 +1253,7 @@ async def test_expense_management_detail_is_read_only_for_other_member(session):
     )
     await callback_expense_delete_confirm(forged_query, session)
     assert forged_query.answers[-1] == (
-        "Изменять и удалять трату может только её автор или владелец тусовки.",
+        "Изменять и удалять трату может только её автор или владелец списка.",
         True,
     )
 
@@ -1356,8 +1497,8 @@ async def test_expense_category_default_all_flow_has_fast_default_button(session
         session,
     )
     assert done_message.edits
-    assert "из своих, платил" in done_message.edits[-1][0]
-    assert "долей: 2" in done_message.edits[-1][0]
+    assert "из кармана, платил" in done_message.edits[-1][0]
+    assert "участников: 2" in done_message.edits[-1][0]
 
     summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
     assert [(share.user_id, share.amount) for share in summary.expenses[0].shares] == [(100, 500), (200, 500)]

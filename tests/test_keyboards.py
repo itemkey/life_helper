@@ -24,6 +24,7 @@ from app.tgbot.keyboards import (
     receipt_items_keyboard,
     shopping_categories_keyboard,
     shopping_category_keyboard,
+    shopping_category_select_keyboard,
     shopping_category_settings_keyboard,
 )
 
@@ -34,7 +35,7 @@ def test_list_keyboard_has_refresh_button():
     keyboard = list_keyboard(shopping_list, [], AccessLevel.owner)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.text == "Обновить" and button.callback_data == "refresh:1" for button in buttons)
+    assert any(button.text == "↻ Обновить" and button.callback_data == "refresh:1" for button in buttons)
 
 
 def test_list_keyboard_has_members_button():
@@ -43,7 +44,7 @@ def test_list_keyboard_has_members_button():
     keyboard = list_keyboard(shopping_list, [], AccessLevel.member)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.text == "Участники списка" and button.callback_data == "members:1" for button in buttons)
+    assert any(button.text == "Участники" and button.callback_data == "members:1" for button in buttons)
 
 
 def test_list_keyboard_has_categories_and_money_buttons():
@@ -52,12 +53,24 @@ def test_list_keyboard_has_categories_and_money_buttons():
     keyboard = list_keyboard(shopping_list, [], AccessLevel.member)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert not any(button.text == "Добавить" for button in buttons)
+    assert any(button.text == "＋ Добавить" and button.callback_data == "add:1" for button in buttons)
     assert any(
-        button.text == "Категории списков" and button.callback_data == "shopping_categories:1"
+        button.text == "Разделы" and button.callback_data == "shopping_categories:1"
         for button in buttons
     )
     assert any(button.text == "Деньги" and button.callback_data == "money:1" for button in buttons)
+
+
+def test_add_chooser_keeps_personal_path_visible_with_only_common_section():
+    shopping_list = ShoppingList(id=1, owner_id=100, title="Дом")
+    category = ShoppingCategory(id=10, list_id=1, title="Общее", scope="common", accounting_mode="per_item")
+
+    keyboard = shopping_category_select_keyboard(shopping_list, [category], user_id=100)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert any(button.callback_data == "add_category:10" for button in buttons)
+    assert any(button.text == "В мой личный раздел" and button.callback_data == "add_personal:1" for button in buttons)
+    assert any(button.callback_data == "shopping_categories:1" for button in buttons)
 
 
 def test_money_keyboard_has_party_money_actions():
@@ -66,10 +79,10 @@ def test_money_keyboard_has_party_money_actions():
     keyboard = money_keyboard(shopping_list, has_expenses=True)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.text == "Взнос" and button.callback_data == "contribution:1" for button in buttons)
-    assert any(button.text == "Трата" and button.callback_data == "expense:1" for button in buttons)
+    assert any(button.text == "Добавить взнос" and button.callback_data == "contribution:1" for button in buttons)
+    assert any(button.text == "Записать трату" and button.callback_data == "expense:1" for button in buttons)
     assert any(button.text == "Категории трат" and button.callback_data == "categories:1" for button in buttons)
-    assert any(button.text == "Итог" and button.callback_data == "money_final:1" for button in buttons)
+    assert any(button.text == "Кто кому должен" and button.callback_data == "money_final:1" for button in buttons)
     assert any(
         button.text == "Управление тратами" and button.callback_data == "expense_manage_list:1"
         for button in buttons
@@ -299,8 +312,8 @@ def test_shopping_categories_keyboard_has_add_and_open_actions():
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
     assert any(button.callback_data == "shopping_category:10" for button in buttons)
-    assert any(button.text == "Добавить общую" and button.callback_data == "shopping_category_add_common:1" for button in buttons)
-    assert any(button.text == "Добавить личную" and button.callback_data == "shopping_category_add_personal:1" for button in buttons)
+    assert any(button.text == "＋ Общий раздел" and button.callback_data == "shopping_category_add_common:1" for button in buttons)
+    assert any(button.text == "＋ Личный раздел" and button.callback_data == "shopping_category_add_personal:1" for button in buttons)
 
 
 def test_shopping_category_keyboard_has_main_actions():
@@ -316,10 +329,11 @@ def test_shopping_category_keyboard_has_main_actions():
     keyboard = shopping_category_keyboard(category, AccessLevel.owner, user_id=100)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.text == "Чек" and button.callback_data == "receipt:10" for button in buttons)
-    assert any(button.text == "Добавить товар" and button.callback_data == "add_category:10" for button in buttons)
+    assert any(button.text == "Записать чек" and button.callback_data == "receipt:10" for button in buttons)
+    assert any(button.text == "＋ Добавить товар" and button.callback_data == "add_category:10" for button in buttons)
     assert any(button.text == "Настройки" and button.callback_data == "shopping_category_settings:10" for button in buttons)
-    assert any(button.text == "Назад" and button.callback_data == "shopping_categories:1" for button in buttons)
+    assert any(button.text == "Все разделы" and button.callback_data == "shopping_categories:1" for button in buttons)
+    assert any(button.text == "К списку" and button.callback_data == "open:1" for button in buttons)
     assert not any(button.text == "Считать по товарам" for button in buttons)
     assert not any(button.text == "Удалить" for button in buttons)
 
@@ -359,9 +373,42 @@ def test_checklist_shopping_category_keyboard_has_no_receipt_action():
     keyboard = shopping_category_keyboard(category, AccessLevel.owner, user_id=100)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.text == "Добавить вещь" and button.callback_data == "add_category:10" for button in buttons)
-    assert not any(button.text == "Чек" for button in buttons)
+    assert any(button.text == "＋ Добавить вещь" and button.callback_data == "add_category:10" for button in buttons)
+    assert not any(button.callback_data == "receipt:10" for button in buttons)
     assert any(button.text == "Настройки" and button.callback_data == "shopping_category_settings:10" for button in buttons)
+
+
+def test_per_item_category_does_not_offer_unavailable_receipt_action():
+    category = ShoppingCategory(
+        id=10,
+        list_id=1,
+        title="Продукты",
+        scope="common",
+        accounting_mode="per_item",
+    )
+
+    keyboard = shopping_category_keyboard(category, AccessLevel.owner, user_id=100)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert any(button.callback_data == "add_category:10" for button in buttons)
+    assert not any(button.callback_data == "receipt:10" for button in buttons)
+
+
+def test_other_members_personal_section_has_no_unusable_add_button():
+    category = ShoppingCategory(
+        id=10,
+        list_id=1,
+        title="Личное",
+        scope="personal",
+        owner_id=200,
+        accounting_mode="per_item",
+    )
+
+    keyboard = shopping_category_keyboard(category, AccessLevel.member, user_id=100)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert not any(button.callback_data == "add_category:10" for button in buttons)
+    assert any(button.callback_data == "open:1" for button in buttons)
 
 
 def test_checklist_shopping_category_settings_keyboard_hides_purchase_accounting_actions():
@@ -415,5 +462,5 @@ def test_members_management_keyboard_has_remove_and_ban_buttons():
     keyboard = members_management_keyboard(shopping_list, [(member, user)])
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.callback_data == "member_remove:1:200" for button in buttons)
-    assert any(button.callback_data == "member_ban:1:200" for button in buttons)
+    assert any(button.callback_data == "member_remove_ask:1:200" for button in buttons)
+    assert any(button.callback_data == "member_ban_ask:1:200" for button in buttons)
