@@ -256,6 +256,7 @@ class ListViewMessage(TimestampMixin, Base):
     )
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    page: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     shopping_list: Mapped[ShoppingList] = relationship(back_populates="view_messages")
     user: Mapped[User] = relationship(back_populates="list_view_messages")

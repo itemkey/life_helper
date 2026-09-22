@@ -13,6 +13,7 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.deep_linking import create_start_link
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models import ListViewMessage, ShoppingItem
 from app.services import audit, shopping
 from app.services.access import AccessLevel
 from app.services.errors import AccessDenied, LifeHelperError, ListNotFound, ValidationError
@@ -60,6 +61,7 @@ from app.tgbot.keyboards import (
     shopping_category_keyboard,
     shopping_category_settings_keyboard,
     shopping_category_select_keyboard,
+    uncategorized_keyboard,
 )
 from app.tgbot.states import ShoppingListStates
 from app.tgbot.texts import (
@@ -71,7 +73,7 @@ from app.tgbot.texts import (
     format_expense_category_text,
     format_expense_management_text,
     format_item_text,
-    format_list_text,
+    format_list_overview_pages,
     format_full_list_pages,
     format_lists_text,
     format_money_final_text,
@@ -217,15 +219,29 @@ async def _show_lists(target: Message | CallbackQuery, session: AsyncSession, us
     await _send_or_edit(target, format_lists_text(owned, shared), reply_markup=lists_keyboard(owned, shared))
 
 
-async def _show_list(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
+async def _show_list(
+    target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int, *, page: int | None = None
+) -> None:
     shopping_list, items, level = await shopping.get_list_view(session, user_id=user_id, list_id=list_id)
     _, categories, _ = await shopping.get_shopping_categories(session, user_id=user_id, list_id=list_id)
     collapsed = await shopping.get_collapsed_sections(session, user_id=user_id, list_id=list_id)
+    if page is None:
+        previous = await session.get(ListViewMessage, (list_id, user_id))
+        source_message = target.message if _is_callback_target(target) else None
+        same_view = previous is not None and _message_identity(source_message) == (
+            previous.chat_id, previous.message_id
+        )
+        page = previous.page if same_view else 0
+    pages = format_list_overview_pages(shopping_list, items, categories, user_id=user_id,
+                                       collapsed_category_ids=collapsed)
+    current_page = min(max(page, 0), len(pages) - 1)
+    overview = pages[current_page]
     sent_message = await _send_or_edit(
         target,
-        format_list_text(shopping_list, items, level, categories),
+        overview.text,
         reply_markup=list_keyboard(shopping_list, items, level, user_id=user_id, categories=categories,
-                                   collapsed_category_ids=collapsed),
+                                   collapsed_category_ids=collapsed, visible_category_ids=overview.category_ids,
+                                   page=current_page, total_pages=len(pages)),
     )
     identity = _message_identity(sent_message)
     if identity is not None:
@@ -236,6 +252,7 @@ async def _show_list(target: Message | CallbackQuery, session: AsyncSession, use
             user_id=user_id,
             chat_id=chat_id,
             message_id=message_id,
+            page=current_page,
         )
 
 
@@ -371,6 +388,8 @@ async def _show_shopping_categories(
     session: AsyncSession,
     user_id: int,
     list_id: int,
+    *,
+    page: int = 0,
 ) -> None:
     await _clear_current_list_view(target, session, user_id)
     shopping_list, categories, _ = await shopping.get_shopping_categories(
@@ -378,10 +397,15 @@ async def _show_shopping_categories(
         user_id=user_id,
         list_id=list_id,
     )
+    total_pages = max(1, (len(categories) + 5) // 6)
+    current_page = min(max(page, 0), total_pages - 1)
+    text = format_shopping_categories_text(shopping_list, categories)
+    if total_pages > 1:
+        text += f"\nСтраница {current_page + 1} из {total_pages}"
     await _send_or_edit(
         target,
-        format_shopping_categories_text(shopping_list, categories),
-        reply_markup=shopping_categories_keyboard(shopping_list, categories),
+        text,
+        reply_markup=shopping_categories_keyboard(shopping_list, categories, page=current_page),
     )
 
 
@@ -390,6 +414,8 @@ async def _show_shopping_category(
     session: AsyncSession,
     user_id: int,
     category_id: int,
+    *,
+    page: int = 0,
 ) -> None:
     await _clear_current_list_view(target, session, user_id)
     shopping_list, category, items, level = await shopping.get_shopping_category_items(
@@ -398,13 +424,46 @@ async def _show_shopping_category(
         category_id=category_id,
     )
     can_add = category.scope == shopping.ITEM_SCOPE_COMMON or level == AccessLevel.owner or category.owner_id == user_id
+    total_pages = max(1, (len(items) + 5) // 6)
+    current_page = min(max(page, 0), total_pages - 1)
+    text = format_shopping_category_text(category, items, can_add=can_add)
+    if total_pages > 1:
+        text += f"\nСтраница {current_page + 1} из {total_pages}"
     await _send_or_edit(
         target,
-        format_shopping_category_text(category, items, can_add=can_add),
+        text,
         reply_markup=shopping_category_keyboard(
-            category, level, user_id, items, prices_enabled=shopping_list.prices_enabled is not False
+            category, level, user_id, items, prices_enabled=shopping_list.prices_enabled is not False,
+            page=current_page,
         ),
     )
+
+
+async def _show_uncategorized(
+    target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int, *, page: int = 0
+) -> None:
+    shopping_list, items, level = await shopping.get_list_view(session, user_id=user_id, list_id=list_id)
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=user_id, list_id=list_id)
+    known_ids = {category.id for category in categories}
+    ungrouped = [item for item in items if item.category_id is None or item.category_id not in known_ids]
+    total_pages = max(1, (len(ungrouped) + 5) // 6)
+    current_page = min(max(page, 0), total_pages - 1)
+    text = f"<b>Без раздела · {escape(shopping_list.title)}</b>\nОсталось: {sum(not item.is_done for item in ungrouped)} из {len(ungrouped)}"
+    if total_pages > 1:
+        text += f"\nСтраница {current_page + 1} из {total_pages}"
+    await _clear_current_list_view(target, session, user_id)
+    await _send_or_edit(target, text, reply_markup=uncategorized_keyboard(
+        shopping_list, ungrouped, level, user_id, page=current_page
+    ))
+
+
+async def _show_item_parent(
+    target: Message | CallbackQuery, session: AsyncSession, user_id: int, item: ShoppingItem, *, page: int = 0
+) -> None:
+    if item.category_id is None:
+        await _show_uncategorized(target, session, user_id, item.list_id, page=page)
+    else:
+        await _show_shopping_category(target, session, user_id, item.category_id, page=page)
 
 
 async def _show_shopping_category_settings(
@@ -504,6 +563,7 @@ async def _show_cancel_return(
     item_id = int(data.get("cancel_item_id") or data.get("item_id") or 0)
     expense_id = int(data.get("cancel_expense_id") or data.get("expense_id") or 0)
     expense_page = int(data.get("cancel_expense_page") or 0)
+    section_page = int(data.get("cancel_page") or 0)
 
     try:
         if destination == "list" and list_id:
@@ -516,7 +576,10 @@ async def _show_cancel_return(
             await _show_shopping_categories(target, session, user_id, list_id)
             return
         if destination == "shopping_category" and category_id:
-            await _show_shopping_category(target, session, user_id, category_id)
+            await _show_shopping_category(target, session, user_id, category_id, page=section_page)
+            return
+        if destination == "uncategorized" and list_id:
+            await _show_uncategorized(target, session, user_id, list_id, page=section_page)
             return
         if destination == "shopping_category_settings" and category_id:
             await _show_shopping_category_settings(target, session, user_id, category_id)
@@ -645,13 +708,21 @@ async def _broadcast_public_list_update(
             collapsed = await shopping.get_collapsed_sections(
                 session, user_id=view_message.user_id, list_id=list_id
             )
+            pages = format_list_overview_pages(shopping_list, items, categories,
+                                               user_id=view_message.user_id, collapsed_category_ids=collapsed)
+            current_page = min(max(view_message.page, 0), len(pages) - 1)
+            overview = pages[current_page]
             await bot.edit_message_text(
-                text=format_list_text(shopping_list, items, level, categories),
+                text=overview.text,
                 chat_id=view_message.chat_id,
                 message_id=view_message.message_id,
                 reply_markup=list_keyboard(shopping_list, items, level, user_id=view_message.user_id,
-                                           categories=categories, collapsed_category_ids=collapsed),
+                                           categories=categories, collapsed_category_ids=collapsed,
+                                           visible_category_ids=overview.category_ids,
+                                           page=current_page, total_pages=len(pages)),
             )
+            if view_message.page != current_page:
+                view_message.page = current_page
         except TelegramBadRequest as error:
             if "message is not modified" in str(error).lower():
                 continue
@@ -789,6 +860,25 @@ async def callback_refresh_list(query: CallbackQuery, session: AsyncSession) -> 
         return
     try:
         await _show_list(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data == "ui_separator")
+async def callback_ui_separator(query: CallbackQuery) -> None:
+    await _answer_callback(query)
+
+
+@router.callback_query(F.data.startswith("list_page:"))
+async def callback_list_page(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    ids = _parse_two_ids(query.data, "list_page:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    list_id, page = ids
+    try:
+        await _show_list(query, session, user_id, list_id, page=page)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -1848,6 +1938,62 @@ async def callback_members_manage(query: CallbackQuery, session: AsyncSession) -
         await _handle_service_error(query, error)
 
 
+@router.callback_query(F.data.startswith("shopping_categories_page:"))
+async def callback_shopping_categories_page(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    await state.clear()
+    ids = _parse_two_ids(query.data, "shopping_categories_page:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    list_id, page = ids
+    try:
+        await _show_shopping_categories(query, session, user_id, list_id, page=page)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("shopping_category_page:"))
+async def callback_shopping_category_page(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    ids = _parse_two_ids(query.data, "shopping_category_page:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    category_id, page = ids
+    try:
+        await _show_shopping_category(query, session, user_id, category_id, page=page)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("uncategorized:"))
+async def callback_uncategorized(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "uncategorized:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_uncategorized(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("uncategorized_page:"))
+async def callback_uncategorized_page(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    ids = _parse_two_ids(query.data, "uncategorized_page:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    list_id, page = ids
+    try:
+        await _show_uncategorized(query, session, user_id, list_id, page=page)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
 async def _confirm_member_action(
     query: CallbackQuery,
     session: AsyncSession,
@@ -2094,7 +2240,7 @@ async def state_add_items(message: Message, state: FSMContext, bot: Bot, session
     raw_category_id = data.get("category_id")
     category_id = int(raw_category_id) if raw_category_id is not None else None
     try:
-        await shopping.add_items(
+        new_items = await shopping.add_items(
             session,
             user_id=user_id,
             list_id=list_id,
@@ -2105,7 +2251,12 @@ async def state_add_items(message: Message, state: FSMContext, bot: Bot, session
         await session.commit()
         await state.clear()
         if category_id is not None and data.get("cancel_return") == "shopping_category":
-            await _show_shopping_category(message, session, user_id, category_id)
+            _, _, category_items, _ = await shopping.get_shopping_category_items(
+                session, user_id=user_id, category_id=category_id
+            )
+            ordered = sorted(category_items, key=lambda entry: (entry.is_done, entry.position, entry.id))
+            new_page = next(index // 6 for index, item in enumerate(ordered) if item.id == new_items[-1].id)
+            await _show_shopping_category(message, session, user_id, category_id, page=new_page)
         else:
             await _show_list(message, session, user_id, list_id)
         await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
@@ -2121,8 +2272,13 @@ async def callback_toggle_item(
     state: FSMContext | None = None,
 ) -> None:
     user_id = await _ensure_user(session, query.from_user)
-    item_id = _parse_id(query.data, "toggle:")
-    if item_id is None:
+    parts = (query.data or "").removeprefix("toggle:").split(":")
+    try:
+        if len(parts) not in {1, 2}:
+            raise ValueError
+        item_id = int(parts[0])
+        page = int(parts[1]) if len(parts) == 2 else 0
+    except ValueError:
         await _answer_callback(query, "Не понял кнопку.", show_alert=True)
         return
     try:
@@ -2130,7 +2286,7 @@ async def callback_toggle_item(
         if shopping_list.prices_enabled is False:
             list_id = await shopping.toggle_item(session, user_id=user_id, item_id=item.id)
             await session.commit()
-            await _show_list(query, session, user_id, list_id)
+            await _show_item_parent(query, session, user_id, item, page=page)
             await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
             return
         if item.is_done:
@@ -2145,14 +2301,14 @@ async def callback_toggle_item(
                 return
             list_id = await shopping.unmark_item(session, user_id=user_id, item_id=item_id)
             await session.commit()
-            await _show_list(query, session, user_id, list_id)
+            await _show_item_parent(query, session, user_id, item, page=page)
             await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
             return
 
         if await shopping.has_recorded_item_purchase(session, item):
             list_id = await shopping.toggle_item(session, user_id=user_id, item_id=item.id)
             await session.commit()
-            await _show_list(query, session, user_id, list_id)
+            await _show_item_parent(query, session, user_id, item, page=page)
             await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
             return
 
@@ -2166,7 +2322,7 @@ async def callback_toggle_item(
         if item.category is not None and item.category.accounting_mode == shopping.SHOPPING_CATEGORY_MODE_CHECKLIST:
             list_id = await shopping.toggle_item(session, user_id=user_id, item_id=item.id)
             await session.commit()
-            await _show_list(query, session, user_id, list_id)
+            await _show_item_parent(query, session, user_id, item, page=page)
             await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
             return
         await shopping.clear_list_view_message(session, list_id=item.list_id, user_id=user_id)
@@ -2175,8 +2331,11 @@ async def callback_toggle_item(
         await state.update_data(
             item_id=item.id,
             list_id=item.list_id,
-            cancel_return="list",
+            item_page=page,
+            cancel_return="shopping_category" if item.category_id is not None else "uncategorized",
             cancel_list_id=item.list_id,
+            cancel_category_id=item.category_id,
+            cancel_page=page,
         )
         await _send_or_edit(
             query,
@@ -2263,7 +2422,8 @@ async def _record_item_purchase_from_state(
     )
     await session.commit()
     await state.clear()
-    await _show_list(query, session, user_id, list_id)
+    _, item, _ = await shopping.get_item_view(session, user_id=user_id, item_id=int(data.get("item_id", 0)))
+    await _show_item_parent(query, session, user_id, item, page=int(data.get("item_page", 0)))
     await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
 
 

@@ -75,64 +75,83 @@ def list_keyboard(
     user_id: int | None = None,
     categories: Sequence[ShoppingCategory] = (),
     collapsed_category_ids: frozenset[int] | set[int] = frozenset(),
+    visible_category_ids: Sequence[int | None] | None = None,
+    page: int = 0,
+    total_pages: int = 1,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     items_by_category: dict[int, list[ShoppingItem]] = {}
-    uncategorized: list[ShoppingItem] = []
     for item in items:
-        if item.category_id is None:
-            uncategorized.append(item)
-        else:
+        if item.category_id is not None:
             items_by_category.setdefault(item.category_id, []).append(item)
 
     ordered_categories = sorted(categories, key=lambda entry: (entry.scope != "common", entry.position, entry.id))
+    known_ids = {category.id for category in ordered_categories}
+    visible_ids = set(visible_category_ids) if visible_category_ids is not None else None
+    previous_group: tuple[str, int | None] | None = None
     for category in ordered_categories:
-        category_items = items_by_category.pop(category.id, [])
-        is_collapsed = category.id in collapsed_category_ids
-        title = _short(category.title, 34)
-        if category.scope == "personal":
-            owner = _user_label(category.owner) if category.owner else f"ID {category.owner_id}"
-            title = f"👤 Мой · {title}" if category.owner_id == user_id else f"👤 {owner} · {title}"
+        if visible_ids is not None and category.id not in visible_ids:
+            continue
+        group = (category.scope, category.owner_id if category.scope == "personal" else None)
+        if group != previous_group:
+            if category.scope == "personal":
+                owner = "Мои разделы" if category.owner_id == user_id else (
+                    _user_label(category.owner) if category.owner else f"ID {category.owner_id}"
+                )
+                separator = f"── 👤 {_short(owner, 35)} ──"
+            else:
+                separator = "── Общие разделы ──"
         else:
-            title = f"📁 {title}"
-        if shopping_list.prices_enabled is not False:
-            mode = {"receipt": "по чеку", "checklist": "без цен"}.get(category.accounting_mode, "по товарам")
-            title = _short(f"{title} · {mode}", 56)
+            separator = "────────────"
+        rows.append([InlineKeyboardButton(text=separator, callback_data="ui_separator")])
+        previous_group = group
+        category_items = items_by_category.get(category.id, [])
+        is_collapsed = category.id in collapsed_category_ids
         remaining = sum(not item.is_done for item in category_items)
         count = f"{remaining}/{len(category_items)}"
         rows.append([
             InlineKeyboardButton(
-                text=f"{'▸' if is_collapsed else '▾'} {_short(title, 48 - len(count))} · {count}",
-                callback_data=f"section_toggle:{shopping_list.id}:{category.id}",
+                text=f"{_short(category.title, max(10, 38 - len(count)))} · {count}",
+                callback_data=f"shopping_category:{category.id}",
             ),
-            InlineKeyboardButton(text="⚙️", callback_data=f"shopping_category:{category.id}"),
+            InlineKeyboardButton(text="▸" if is_collapsed else "▾", callback_data=f"section_toggle:{shopping_list.id}:{category.id}"),
         ])
-        if is_collapsed:
-            continue
-        for item in sorted(category_items, key=lambda entry: (entry.is_done, entry.position, entry.id)):
-            can_toggle = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
-            rows.append(_item_buttons(item, shopping_list.prices_enabled is not False, can_toggle=can_toggle))
-        if category.scope == "common" or level == AccessLevel.owner or category.owner_id == user_id:
-            rows.append([InlineKeyboardButton(text="＋ Добавить сюда", callback_data=f"add_category:{category.id}")])
-
-    remaining_items = [*uncategorized, *(item for group in items_by_category.values() for item in group)]
-    if remaining_items:
-        rows.append([InlineKeyboardButton(text="📁 Без раздела", callback_data=f"shopping_categories:{shopping_list.id}")])
-        for item in sorted(remaining_items, key=lambda entry: (entry.is_done, entry.position, entry.id)):
-            can_toggle = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
-            rows.append(_item_buttons(item, shopping_list.prices_enabled is not False, can_toggle=can_toggle))
-
-    if ordered_categories:
-        all_collapsed = all(category.id in collapsed_category_ids for category in ordered_categories)
+    if (visible_ids is None or None in visible_ids) and any(
+        item.category_id is None or item.category_id not in known_ids
+        for item in items
+    ):
+        rows.append([InlineKeyboardButton(text="── Без раздела ──", callback_data="ui_separator")])
+        rows.append([InlineKeyboardButton(text="Открыть пункты без раздела", callback_data=f"uncategorized:{shopping_list.id}")])
+    if total_pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton(text="←", callback_data=f"list_page:{shopping_list.id}:{page - 1}"))
+        navigation.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ui_separator"))
+        if page + 1 < total_pages:
+            navigation.append(InlineKeyboardButton(text="→", callback_data=f"list_page:{shopping_list.id}:{page + 1}"))
+        rows.append(navigation)
+    active_categories = [category for category in ordered_categories if items_by_category.get(category.id)]
+    if active_categories:
+        all_collapsed = all(category.id in collapsed_category_ids for category in active_categories)
         action = "expand" if all_collapsed else "collapse"
         label = "Развернуть все" if all_collapsed else "Свернуть все"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"section_toggle_all:{shopping_list.id}:{action}")])
-    rows.append([InlineKeyboardButton(text="📄 Список текстом", callback_data=f"list_text:{shopping_list.id}:0")])
-    rows.append([InlineKeyboardButton(text="＋ Добавить пункт", callback_data=f"add:{shopping_list.id}")])
-    rows.append([InlineKeyboardButton(text="Разделы", callback_data=f"shopping_categories:{shopping_list.id}")])
+        rows.append([
+            InlineKeyboardButton(text=label, callback_data=f"section_toggle_all:{shopping_list.id}:{action}"),
+            InlineKeyboardButton(text="📄 Весь список", callback_data=f"list_text:{shopping_list.id}:0"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="📄 Весь список", callback_data=f"list_text:{shopping_list.id}:0")])
+    rows.append([
+        InlineKeyboardButton(text="＋ Добавить пункт", callback_data=f"add:{shopping_list.id}"),
+        InlineKeyboardButton(text="Разделы", callback_data=f"shopping_categories:{shopping_list.id}"),
+    ])
     if shopping_list.prices_enabled is not False:
-        rows.append([InlineKeyboardButton(text="Деньги", callback_data=f"money:{shopping_list.id}")])
-    rows.append([InlineKeyboardButton(text="Участники", callback_data=f"members:{shopping_list.id}")])
+        rows.append([
+            InlineKeyboardButton(text="Деньги", callback_data=f"money:{shopping_list.id}"),
+            InlineKeyboardButton(text="Участники", callback_data=f"members:{shopping_list.id}"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="Участники", callback_data=f"members:{shopping_list.id}")])
     if level == AccessLevel.owner:
         rows.append([InlineKeyboardButton(text="⚙️ Настройки списка", callback_data=f"settings:{shopping_list.id}")])
     rows.append([
@@ -155,9 +174,35 @@ def list_text_keyboard(list_id: int, *, page: int, total_pages: int) -> InlineKe
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _item_buttons(item: ShoppingItem, prices_enabled: bool, *, can_toggle: bool = True) -> list[InlineKeyboardButton]:
+def uncategorized_keyboard(
+    shopping_list: ShoppingList, items: Sequence[ShoppingItem], level: AccessLevel, user_id: int, *, page: int = 0
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    ordered = sorted(items, key=lambda entry: (entry.is_done, entry.position, entry.id))
+    total_pages = max(1, (len(ordered) + 5) // 6)
+    current_page = min(max(page, 0), total_pages - 1)
+    for item in ordered[current_page * 6:(current_page + 1) * 6]:
+        can_toggle = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
+        rows.append(_item_buttons(item, shopping_list.prices_enabled is not False, can_toggle=can_toggle,
+                                  page=current_page))
+    if total_pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if current_page > 0:
+            navigation.append(InlineKeyboardButton(text="←", callback_data=f"uncategorized_page:{shopping_list.id}:{current_page - 1}"))
+        navigation.append(InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data="ui_separator"))
+        if current_page + 1 < total_pages:
+            navigation.append(InlineKeyboardButton(text="→", callback_data=f"uncategorized_page:{shopping_list.id}:{current_page + 1}"))
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text="К списку", callback_data=f"open:{shopping_list.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _item_buttons(
+    item: ShoppingItem, prices_enabled: bool, *, can_toggle: bool = True, page: int | None = None
+) -> list[InlineKeyboardButton]:
     mark = "✓" if item.is_done else "□"
-    callback = f"item_open:{item.id}" if not can_toggle or (prices_enabled and item.category is not None and item.category.accounting_mode == "receipt") else f"toggle:{item.id}"
+    toggle_callback = f"toggle:{item.id}" if page is None else f"toggle:{item.id}:{page}"
+    callback = f"item_open:{item.id}" if not can_toggle or (prices_enabled and item.category is not None and item.category.accounting_mode == "receipt") else toggle_callback
     label = f"🔒 {_short(item.text, 34)}" if not can_toggle else f"{mark} {_short(item.text, 34)}"
     return [
         InlineKeyboardButton(text=label, callback_data=callback),
@@ -231,9 +276,13 @@ def _shopping_category_label(category: ShoppingCategory, *, current_user_id: int
 def shopping_categories_keyboard(
     shopping_list: ShoppingList,
     categories: Sequence[ShoppingCategory],
+    *,
+    page: int = 0,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for category in categories:
+    total_pages = max(1, (len(categories) + 5) // 6)
+    current_page = min(max(page, 0), total_pages - 1)
+    for category in categories[current_page * 6:(current_page + 1) * 6]:
         rows.append(
             [
                 InlineKeyboardButton(
@@ -242,6 +291,14 @@ def shopping_categories_keyboard(
                 )
             ]
         )
+    if total_pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if current_page > 0:
+            navigation.append(InlineKeyboardButton(text="←", callback_data=f"shopping_categories_page:{shopping_list.id}:{current_page - 1}"))
+        navigation.append(InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data="ui_separator"))
+        if current_page + 1 < total_pages:
+            navigation.append(InlineKeyboardButton(text="→", callback_data=f"shopping_categories_page:{shopping_list.id}:{current_page + 1}"))
+        rows.append(navigation)
     rows.append(
         [
             InlineKeyboardButton(text="＋ Общий раздел", callback_data=f"shopping_category_add_common:{shopping_list.id}"),
@@ -259,15 +316,28 @@ def shopping_category_keyboard(
     items: Sequence[ShoppingItem] = (),
     *,
     prices_enabled: bool = True,
+    page: int = 0,
 ) -> InlineKeyboardMarkup:
     can_edit = level == AccessLevel.owner or (category.scope == "personal" and category.owner_id == user_id)
     can_add = category.scope == "common" or can_edit
-    add_label = "＋ Добавить пункт" if not prices_enabled else ("＋ Добавить вещь" if category.accounting_mode == "checklist" else "＋ Добавить товар")
+    add_label = "＋ Добавить сюда"
     rows: list[list[InlineKeyboardButton]] = []
     if can_add:
         rows.append([InlineKeyboardButton(text=add_label, callback_data=f"add_category:{category.id}")])
-    for item in sorted(items, key=lambda entry: (entry.is_done, entry.position, entry.id)):
-        rows.append(_item_buttons(item, prices_enabled, can_toggle=can_edit or item.scope != "personal"))
+    ordered_items = sorted(items, key=lambda entry: (entry.is_done, entry.position, entry.id))
+    total_pages = max(1, (len(ordered_items) + 5) // 6)
+    current_page = min(max(page, 0), total_pages - 1)
+    for item in ordered_items[current_page * 6:(current_page + 1) * 6]:
+        rows.append(_item_buttons(item, prices_enabled, can_toggle=can_edit or item.scope != "personal",
+                                  page=current_page))
+    if total_pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if current_page > 0:
+            navigation.append(InlineKeyboardButton(text="←", callback_data=f"shopping_category_page:{category.id}:{current_page - 1}"))
+        navigation.append(InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data="ui_separator"))
+        if current_page + 1 < total_pages:
+            navigation.append(InlineKeyboardButton(text="→", callback_data=f"shopping_category_page:{category.id}:{current_page + 1}"))
+        rows.append(navigation)
     if prices_enabled and category.accounting_mode == "receipt":
         rows.append([InlineKeyboardButton(text="Записать чек", callback_data=f"receipt:{category.id}")])
     if can_edit:

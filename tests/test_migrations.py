@@ -112,3 +112,24 @@ def test_collapsed_sections_migration_preserves_existing_lists_and_items(monkeyp
             assert connection.execute(sa.text("SELECT list_id, user_id, category_id FROM collapsed_list_sections")).all() == [(1, 100, 10)]
     finally:
         engine.dispose()
+
+
+def test_overview_page_migration_keeps_existing_view_messages(monkeypatch) -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    migration = importlib.import_module("app.migrations.versions.0012_list_view_page")
+    try:
+        with engine.begin() as connection:
+            connection.execute(sa.text(
+                "CREATE TABLE list_view_messages (list_id INTEGER NOT NULL, user_id INTEGER NOT NULL, "
+                "chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY (list_id, user_id))"
+            ))
+            connection.execute(sa.text(
+                "INSERT INTO list_view_messages (list_id, user_id, chat_id, message_id) VALUES (1, 100, 1000, 20)"
+            ))
+            monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
+            migration.upgrade()
+            assert connection.execute(sa.text(
+                "SELECT list_id, user_id, chat_id, message_id, page FROM list_view_messages"
+            )).all() == [(1, 100, 1000, 20, 0)]
+    finally:
+        engine.dispose()

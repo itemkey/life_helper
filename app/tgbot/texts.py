@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import timedelta, timezone
 from html import escape
 
@@ -84,6 +85,8 @@ def format_full_list_pages(
             items_by_category.get(category.id, []),
             key=lambda entry: (entry.is_done, entry.position, entry.id),
         )
+        if not category_items:
+            continue
         if category.scope == "personal":
             owner = "мой" if category.owner_id == user_id else (
                 _format_user_name(category.owner) if category.owner is not None else f"ID {category.owner_id}"
@@ -131,6 +134,97 @@ def format_full_list_pages(
     if len(pages) > 1:
         return [f"{page}\n\nСтраница {index} из {len(pages)}" for index, page in enumerate(pages, start=1)]
     return pages
+
+
+@dataclass(frozen=True)
+class ListOverviewPage:
+    text: str
+    category_ids: tuple[int | None, ...]
+
+
+def format_list_overview_pages(
+    shopping_list: ShoppingList,
+    items: Sequence[ShoppingItem],
+    categories: Sequence[ShoppingCategory],
+    *,
+    user_id: int,
+    collapsed_category_ids: set[int] | frozenset[int] = frozenset(),
+) -> list[ListOverviewPage]:
+    """Keep both the text and its section buttons small enough for a phone screen."""
+    remaining = sum(not item.is_done for item in items)
+    header = [f"<b>{escape(shopping_list.title)}</b>", f"Осталось: {remaining} из {len(items)}", ""]
+    by_category: dict[int, list[ShoppingItem]] = {}
+    category_ids = {category.id for category in categories}
+    uncategorized: list[ShoppingItem] = []
+    for item in items:
+        if item.category_id in category_ids:
+            by_category.setdefault(item.category_id, []).append(item)
+        else:
+            uncategorized.append(item)
+
+    sections: list[tuple[int | None, str, list[str]]] = []
+    for category in sorted(categories, key=lambda entry: (entry.scope != "common", entry.position, entry.id)):
+        section_items = sorted(by_category.get(category.id, []), key=lambda entry: (entry.is_done, entry.position, entry.id))
+        if not section_items:
+            continue
+        if category.scope == "personal":
+            owner = "мой" if category.owner_id == user_id else (
+                _format_user_name(category.owner) if category.owner is not None else f"ID {category.owner_id}"
+            )
+            heading = f"👤 {escape(category.title)} · {owner}"
+        else:
+            heading = f"📁 {escape(category.title)}"
+        heading = f"<b>{heading}</b> · {sum(not item.is_done for item in section_items)}/{len(section_items)}"
+        item_lines = [] if category.id in collapsed_category_ids else [
+            f"{'✓' if item.is_done else '□'} {escape(item.text)}" for item in section_items
+        ]
+        sections.append((category.id, heading, item_lines))
+    if uncategorized:
+        section_items = sorted(uncategorized, key=lambda entry: (entry.is_done, entry.position, entry.id))
+        sections.append((None, "<b>📁 Без раздела</b>", [
+            f"{'✓' if item.is_done else '□'} {escape(item.text)}" for item in section_items
+        ]))
+    if not sections:
+        return [ListOverviewPage("\n".join([*header, "Пока пусто"]), ())]
+
+    pages: list[ListOverviewPage] = []
+    lines = header.copy()
+    current_ids: list[int | None] = []
+    section_count = 0
+    item_count = 0
+
+    def flush() -> None:
+        nonlocal lines, current_ids, section_count, item_count
+        pages.append(ListOverviewPage("\n".join(lines).rstrip(), tuple(current_ids)))
+        lines = header.copy()
+        current_ids = []
+        section_count = 0
+        item_count = 0
+
+    def fits(*extra: str) -> bool:
+        return len("\n".join([*lines, *extra])) <= 3000
+
+    for category_id, heading, item_lines in sections:
+        if section_count == 2 or item_count >= 8 or (section_count and not fits("────────────", heading)):
+            flush()
+        if section_count:
+            lines.extend(["", "────────────"])
+        lines.extend(["", heading])
+        section_count += 1
+        current_ids.append(category_id)
+        for item_line in item_lines:
+            if item_count >= 8 or not fits(item_line):
+                flush()
+                lines.extend(["", heading])
+                section_count = 1
+                current_ids.append(category_id)
+            lines.append(item_line)
+            item_count += 1
+    flush()
+    if len(pages) == 1:
+        return pages
+    return [ListOverviewPage(f"{page.text}\n\nСтраница {index} из {len(pages)}", page.category_ids)
+            for index, page in enumerate(pages, start=1)]
 
 
 def _format_shopping_category_heading(category: ShoppingCategory) -> str:

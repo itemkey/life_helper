@@ -1099,6 +1099,7 @@ async def save_list_view_message(
     user_id: int,
     chat_id: int,
     message_id: int,
+    page: int = 0,
 ) -> ListViewMessage:
     view_message = await session.get(ListViewMessage, (list_id, user_id))
     if view_message is None:
@@ -1107,11 +1108,13 @@ async def save_list_view_message(
             user_id=user_id,
             chat_id=chat_id,
             message_id=message_id,
+            page=page,
         )
         session.add(view_message)
     else:
         view_message.chat_id = chat_id
         view_message.message_id = message_id
+        view_message.page = page
     await session.flush()
     return view_message
 
