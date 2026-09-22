@@ -87,6 +87,18 @@ def _normalize_item_lines(text: str) -> list[str]:
     return lines
 
 
+def _normalize_item_title(text: str) -> str:
+    lines = _normalize_item_lines(text)
+    if len(lines) != 1:
+        raise ValidationError("Укажи одно название пункта.")
+    return lines[0]
+
+
+def _require_prices_enabled(shopping_list: ShoppingList) -> None:
+    if not shopping_list.prices_enabled:
+        raise ValidationError("В этом списке выключен учёт денег.")
+
+
 def _normalize_expense_title(title: str) -> str:
     value = " ".join(title.strip().split())
     if not value:
@@ -477,6 +489,7 @@ async def delete_expense_category(
     category_id: int,
 ) -> int:
     shopping_list, category, _ = await get_expense_category(session, user_id=user_id, category_id=category_id)
+    _require_prices_enabled(shopping_list)
     category_expense_ids = select(Expense.id).where(
         Expense.list_id == shopping_list.id,
         Expense.category_id == category.id,
@@ -555,6 +568,7 @@ async def _get_manual_expense_for_update(
     expense_id: int,
 ) -> tuple[ShoppingList, Expense]:
     shopping_list, expense = await get_expense(session, user_id=user_id, expense_id=expense_id)
+    _require_prices_enabled(shopping_list)
     _ensure_expense_management_allowed(shopping_list, expense, user_id=user_id)
     _ensure_manual_expense(expense)
     return shopping_list, expense
@@ -704,6 +718,7 @@ async def delete_expense(
     expense_id: int,
 ) -> int:
     shopping_list, expense = await get_expense(session, user_id=user_id, expense_id=expense_id)
+    _require_prices_enabled(shopping_list)
     _ensure_expense_management_allowed(shopping_list, expense, user_id=user_id)
     if expense.item is not None:
         expense.item.is_done = False
@@ -1160,6 +1175,7 @@ async def _get_item_with_access(
             selectinload(ShoppingItem.personal_owner),
             selectinload(ShoppingItem.category).selectinload(ShoppingCategory.owner),
             selectinload(ShoppingItem.expense_links).selectinload(ExpenseItem.expense),
+            selectinload(ShoppingItem.expenses),
         )
         .where(ShoppingItem.id == item_id)
     )
@@ -1255,6 +1271,47 @@ async def get_item_view(
     return await _get_item_with_access(session, user_id=user_id, item_id=item_id)
 
 
+async def has_recorded_item_purchase(session: AsyncSession, item: ShoppingItem) -> bool:
+    if item.expense_links:
+        return True
+    return bool(await session.scalar(select(Expense.id).where(Expense.item_id == item.id)))
+
+
+async def rename_item(session: AsyncSession, *, user_id: int, item_id: int, title: str) -> ShoppingItem:
+    shopping_list, item, level = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
+    _ensure_item_edit_allowed(shopping_list=shopping_list, item=item, user_id=user_id, level=level)
+    item.text = _normalize_item_title(title)
+    await session.flush()
+    return item
+
+
+async def move_item(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    item_id: int,
+    category_id: int,
+) -> ShoppingItem:
+    shopping_list, item, level = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
+    _ensure_item_edit_allowed(shopping_list=shopping_list, item=item, user_id=user_id, level=level)
+    _, category, _ = await get_shopping_category(session, user_id=user_id, category_id=category_id)
+    if category.list_id != shopping_list.id:
+        raise ValidationError("Раздел должен принадлежать этому списку.")
+    _ensure_shopping_category_add_allowed(category=category, user_id=user_id, level=level)
+    if item.category_id == category.id:
+        return item
+    if await has_recorded_item_purchase(session, item):
+        raise ValidationError("Пункт связан с записью о трате и не может быть перенесён.")
+    if item.is_done:
+        raise ValidationError("Сначала сними отметку с пункта.")
+    item.category_id = category.id
+    item.category = category
+    item.scope = category.scope
+    item.personal_owner_id = category.owner_id if category.scope == ITEM_SCOPE_PERSONAL else None
+    await session.flush()
+    return item
+
+
 async def create_contribution(
     session: AsyncSession,
     *,
@@ -1265,6 +1322,7 @@ async def create_contribution(
     note: str | None = None,
 ) -> Contribution:
     shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
+    _require_prices_enabled(shopping_list)
     contributor_id = contributor_id or user_id
     if contributor_id != user_id and level != AccessLevel.owner:
         raise AccessDenied("Записать взнос за другого участника может только владелец списка.")
@@ -1301,6 +1359,7 @@ async def create_expense(
     category_id: int | None = None,
 ) -> Expense:
     shopping_list, level = await require_access(session, user_id=user_id, list_id=list_id)
+    _require_prices_enabled(shopping_list)
     payer_id = payer_id or user_id
     if source not in {EXPENSE_SOURCE_CASHBOX, EXPENSE_SOURCE_PERSONAL}:
         raise ValidationError("Не понял источник оплаты.")
@@ -1367,6 +1426,8 @@ async def record_item_purchase(
     _, item, _ = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
     if item.is_done:
         raise ValidationError("Эта покупка уже отмечена купленной.")
+    if await has_recorded_item_purchase(session, item):
+        raise ValidationError("Для этого пункта уже сохранена покупка. Проверь записи о тратах.")
 
     if item.category is not None and item.category.accounting_mode == SHOPPING_CATEGORY_MODE_RECEIPT:
         raise ValidationError("Эта категория считается по чеку. Открой категорию и внеси общий чек.")
@@ -1438,6 +1499,10 @@ async def record_receipt_purchase(
         raise ValidationError("В чек можно добавить только товары выбранной категории.")
     if any(item.is_done for item in items):
         raise ValidationError("В чеке есть товар, который уже отмечен купленным.")
+    if await session.scalar(select(ExpenseItem.item_id).where(ExpenseItem.item_id.in_(selected_item_ids))):
+        raise ValidationError("Один из товаров уже есть в сохранённом чеке.")
+    if await session.scalar(select(Expense.item_id).where(Expense.item_id.in_(selected_item_ids))):
+        raise ValidationError("Для одного из товаров уже сохранена покупка.")
 
     default_share_user_ids = (
         share_user_ids
@@ -1498,6 +1563,7 @@ async def cancel_receipt_expense(
     if expense is None:
         raise ListNotFound("Чек не найден.")
     shopping_list, _ = await require_access(session, user_id=user_id, list_id=expense.list_id)
+    _require_prices_enabled(shopping_list)
     _ensure_expense_management_allowed(shopping_list, expense, user_id=user_id)
     if expense.item_id is not None or not expense.item_links:
         raise ValidationError("Это не чековая покупка.")
@@ -1630,6 +1696,19 @@ async def rename_list(
 ) -> ShoppingList:
     shopping_list, _ = await require_access(session, user_id=owner_id, list_id=list_id, owner_only=True)
     shopping_list.title = _normalize_title(title)
+    await session.flush()
+    return shopping_list
+
+
+async def set_list_prices_enabled(
+    session: AsyncSession,
+    *,
+    owner_id: int,
+    list_id: int,
+    enabled: bool,
+) -> ShoppingList:
+    shopping_list, _ = await require_access(session, user_id=owner_id, list_id=list_id, owner_only=True)
+    shopping_list.prices_enabled = enabled
     await session.flush()
     return shopping_list
 

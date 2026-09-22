@@ -44,6 +44,79 @@ async def test_owner_can_manage_shopping_list(session):
     assert shopping_list.title == "Дача"
 
 
+async def test_simple_mode_preserves_existing_items_and_money_and_blocks_new_charges(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Семья")
+    item = (await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Молоко"))[0]
+    await shopping.create_contribution(session, user_id=100, list_id=shopping_list.id, amount="50")
+    await shopping.record_item_purchase(
+        session, user_id=100, item_id=item.id, amount="10", source=shopping.EXPENSE_SOURCE_CASHBOX
+    )
+    await session.commit()
+
+    with pytest.raises(AccessDenied):
+        await shopping.set_list_prices_enabled(session, owner_id=200, list_id=shopping_list.id, enabled=False)
+    await shopping.set_list_prices_enabled(session, owner_id=100, list_id=shopping_list.id, enabled=False)
+    await shopping.toggle_item(session, user_id=100, item_id=item.id)
+    await session.commit()
+    assert item.is_done is False
+
+    with pytest.raises(ValidationError, match="выключен"):
+        await shopping.create_contribution(session, user_id=100, list_id=shopping_list.id, amount="5")
+    with pytest.raises(ValidationError, match="выключен"):
+        await shopping.create_expense(
+            session, user_id=100, list_id=shopping_list.id, title="Новая трата", amount="5",
+            source=shopping.EXPENSE_SOURCE_CASHBOX,
+        )
+    saved_expense_id = (await session.scalars(select(Expense.id))).one()
+    with pytest.raises(ValidationError, match="выключен"):
+        await shopping.delete_expense(session, user_id=100, expense_id=saved_expense_id)
+
+    await shopping.set_list_prices_enabled(session, owner_id=100, list_id=shopping_list.id, enabled=True)
+    await session.commit()
+    view, items, _ = await shopping.get_list_view(session, user_id=100, list_id=shopping_list.id)
+    summary = await shopping.get_money_summary(session, user_id=100, list_id=shopping_list.id)
+    assert view.prices_enabled is True
+    assert [(entry.id, entry.text) for entry in items] == [(item.id, "Молоко")]
+    assert summary.cashbox_balance == 4000
+    assert len(summary.contributions) == len(summary.expenses) == 1
+    with pytest.raises(ValidationError, match="уже сохранена покупка"):
+        await shopping.record_item_purchase(
+            session, user_id=100, item_id=item.id, amount="10", source=shopping.EXPENSE_SOURCE_CASHBOX
+        )
+
+
+async def test_item_settings_keep_scope_and_historical_expenses_safe(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Поездка")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    personal = await shopping.create_shopping_category(
+        session, user_id=100, list_id=shopping_list.id, title="В дорогу", scope=shopping.ITEM_SCOPE_PERSONAL
+    )
+    item = (await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Книга"))[0]
+    await shopping.rename_item(session, user_id=100, item_id=item.id, title="  Книга в дорогу ")
+    await shopping.move_item(session, user_id=100, item_id=item.id, category_id=personal.id)
+    assert (item.text, item.category_id, item.scope, item.personal_owner_id) == (
+        "Книга в дорогу", personal.id, shopping.ITEM_SCOPE_PERSONAL, 100
+    )
+    with pytest.raises(AccessDenied):
+        await shopping.rename_item(session, user_id=200, item_id=item.id, title="Чужая книга")
+
+    await shopping.record_item_purchase(
+        session, user_id=100, item_id=item.id, amount="12", source=shopping.EXPENSE_SOURCE_CASHBOX
+    )
+    await shopping.set_list_prices_enabled(session, owner_id=100, list_id=shopping_list.id, enabled=False)
+    await shopping.toggle_item(session, user_id=100, item_id=item.id)
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=shopping_list.id)
+    common = next(category for category in categories if category.scope == shopping.ITEM_SCOPE_COMMON)
+    with pytest.raises(ValidationError, match="связан с записью"):
+        await shopping.move_item(session, user_id=100, item_id=item.id, category_id=common.id)
+    assert item.category_id == personal.id
+
+
 async def test_validation_rejects_empty_values(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
 

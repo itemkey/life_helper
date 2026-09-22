@@ -61,6 +61,7 @@ class ShoppingList(TimestampMixin, Base):
     public_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     public_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="BYN", server_default="BYN")
+    prices_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     cashbox_holder_id: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey("users.id", ondelete="SET NULL"),

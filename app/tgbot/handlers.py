@@ -18,6 +18,7 @@ from app.services.access import AccessLevel
 from app.services.errors import AccessDenied, LifeHelperError, ListNotFound, ValidationError
 from app.tgbot.keyboards import (
     EXPENSE_DELETE_PAGE_SIZE,
+    access_settings_keyboard,
     access_change_confirm_keyboard,
     cancel_keyboard,
     delete_confirm_keyboard,
@@ -36,8 +37,11 @@ from app.tgbot.keyboards import (
     expense_split_keyboard,
     home_keyboard,
     item_delete_confirm_keyboard,
+    item_keyboard,
+    item_move_keyboard,
     item_purchase_source_keyboard,
     list_keyboard,
+    list_mode_keyboard,
     lists_keyboard,
     member_action_confirm_keyboard,
     members_keyboard,
@@ -61,6 +65,7 @@ from app.tgbot.texts import (
     format_expense_category_split_text,
     format_expense_category_text,
     format_expense_management_text,
+    format_item_text,
     format_list_text,
     format_lists_text,
     format_money_final_text,
@@ -211,7 +216,7 @@ async def _show_list(target: Message | CallbackQuery, session: AsyncSession, use
     sent_message = await _send_or_edit(
         target,
         format_list_text(shopping_list, items, level, categories),
-        reply_markup=list_keyboard(shopping_list, items, level, user_id=user_id),
+        reply_markup=list_keyboard(shopping_list, items, level, user_id=user_id, categories=categories),
     )
     identity = _message_identity(sent_message)
     if identity is not None:
@@ -228,6 +233,8 @@ async def _show_list(target: Message | CallbackQuery, session: AsyncSession, use
 async def _show_money(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
     await _clear_current_list_view(target, session, user_id)
     summary = await shopping.get_money_summary(session, user_id=user_id, list_id=list_id)
+    if summary.shopping_list.prices_enabled is False:
+        raise ValidationError("В этом списке выключен учёт денег.")
     await _send_or_edit(
         target,
         format_money_text(summary),
@@ -251,7 +258,6 @@ async def _show_expense_management_list(
     if expenses:
         text = (
             f"<b>Управление тратами: {escape(summary.shopping_list.title)}</b>\n\n"
-            "Выбери трату, чтобы посмотреть подробности, изменить или удалить её.\n\n"
             f"Страница {current_page + 1} из {total_pages}"
         )
     else:
@@ -360,7 +366,7 @@ async def _show_shopping_category(
     category_id: int,
 ) -> None:
     await _clear_current_list_view(target, session, user_id)
-    _, category, items, level = await shopping.get_shopping_category_items(
+    shopping_list, category, items, level = await shopping.get_shopping_category_items(
         session,
         user_id=user_id,
         category_id=category_id,
@@ -369,7 +375,9 @@ async def _show_shopping_category(
     await _send_or_edit(
         target,
         format_shopping_category_text(category, items, can_add=can_add),
-        reply_markup=shopping_category_keyboard(category, level, user_id),
+        reply_markup=shopping_category_keyboard(
+            category, level, user_id, items, prices_enabled=shopping_list.prices_enabled is not False
+        ),
     )
 
 
@@ -380,21 +388,25 @@ async def _show_shopping_category_settings(
     category_id: int,
 ) -> None:
     await _clear_current_list_view(target, session, user_id)
-    _, category, level = await shopping.get_shopping_category(
+    shopping_list, category, level = await shopping.get_shopping_category(
         session,
         user_id=user_id,
         category_id=category_id,
     )
     await _send_or_edit(
         target,
-        format_shopping_category_settings_text(category),
-        reply_markup=shopping_category_settings_keyboard(category, level, user_id),
+        format_shopping_category_settings_text(category, prices_enabled=shopping_list.prices_enabled is not False),
+        reply_markup=shopping_category_settings_keyboard(
+            category, level, user_id, prices_enabled=shopping_list.prices_enabled is not False
+        ),
     )
 
 
 async def _show_money_final(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
     await _clear_current_list_view(target, session, user_id)
     summary = await shopping.get_money_summary(session, user_id=user_id, list_id=list_id)
+    if summary.shopping_list.prices_enabled is False:
+        raise ValidationError("В этом списке выключен учёт денег.")
     await _send_or_edit(
         target,
         format_money_final_text(summary),
@@ -408,6 +420,24 @@ async def _show_settings(target: Message | CallbackQuery, session: AsyncSession,
     await _send_or_edit(target, format_settings_text(shopping_list), reply_markup=settings_keyboard(shopping_list))
 
 
+async def _show_access_settings(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
+    await _clear_current_list_view(target, session, user_id)
+    shopping_list = await shopping.assert_owner(session, owner_id=user_id, list_id=list_id)
+    status = "по ссылке" if shopping_list.is_public else "закрыт"
+    await _send_or_edit(
+        target,
+        f"<b>Участники и доступ · {escape(shopping_list.title)}</b>\nДоступ: {status}",
+        reply_markup=access_settings_keyboard(shopping_list),
+    )
+
+
+async def _show_item(target: Message | CallbackQuery, session: AsyncSession, user_id: int, item_id: int) -> None:
+    shopping_list, item, level = await shopping.get_item_view(session, user_id=user_id, item_id=item_id)
+    await _clear_current_list_view(target, session, user_id)
+    can_edit = item.scope != shopping.ITEM_SCOPE_PERSONAL or level == AccessLevel.owner or item.personal_owner_id == user_id
+    await _send_or_edit(target, format_item_text(item), reply_markup=item_keyboard(shopping_list, item, can_edit=can_edit))
+
+
 async def _show_cancel_return(
     target: Message | CallbackQuery,
     session: AsyncSession,
@@ -417,12 +447,16 @@ async def _show_cancel_return(
     destination = str(data.get("cancel_return") or "")
     list_id = int(data.get("cancel_list_id") or data.get("list_id") or 0)
     category_id = int(data.get("cancel_category_id") or data.get("category_id") or 0)
+    item_id = int(data.get("cancel_item_id") or data.get("item_id") or 0)
     expense_id = int(data.get("cancel_expense_id") or data.get("expense_id") or 0)
     expense_page = int(data.get("cancel_expense_page") or 0)
 
     try:
         if destination == "list" and list_id:
             await _show_list(target, session, user_id, list_id)
+            return
+        if destination == "item" and item_id:
+            await _show_item(target, session, user_id, item_id)
             return
         if destination == "shopping_categories" and list_id:
             await _show_shopping_categories(target, session, user_id, list_id)
@@ -453,6 +487,9 @@ async def _show_cancel_return(
             return
         if destination == "settings" and list_id:
             await _show_settings(target, session, user_id, list_id)
+            return
+        if destination == "settings_access" and list_id:
+            await _show_access_settings(target, session, user_id, list_id)
             return
         if destination == "lists":
             await _show_lists(target, session, user_id)
@@ -555,7 +592,7 @@ async def _broadcast_public_list_update(
                 text=format_list_text(shopping_list, items, level, categories),
                 chat_id=view_message.chat_id,
                 message_id=view_message.message_id,
-                reply_markup=list_keyboard(shopping_list, items, level, user_id=view_message.user_id),
+                reply_markup=list_keyboard(shopping_list, items, level, user_id=view_message.user_id, categories=categories),
             )
         except TelegramBadRequest as error:
             if "message is not modified" in str(error).lower():
@@ -694,6 +731,90 @@ async def callback_refresh_list(query: CallbackQuery, session: AsyncSession) -> 
         return
     try:
         await _show_list(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("item_open:"))
+async def callback_item_open(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    item_id = _parse_id(query.data, "item_open:")
+    if item_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_item(query, session, user_id, item_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("item_rename:"))
+async def callback_item_rename(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    item_id = _parse_id(query.data, "item_rename:")
+    if item_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        shopping_list, item, level = await shopping.get_item_view(session, user_id=user_id, item_id=item_id)
+        if item.scope == shopping.ITEM_SCOPE_PERSONAL and level != AccessLevel.owner and item.personal_owner_id != user_id:
+            raise AccessDenied("Чужой личный раздел нельзя менять.")
+        await state.set_state(ShoppingListStates.renaming_item)
+        await state.update_data(item_id=item_id, list_id=shopping_list.id, cancel_return="item", cancel_item_id=item_id)
+        await _send_or_edit(query, f"Новое название для «{escape(item.text)}»:", reply_markup=cancel_keyboard())
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.message(ShoppingListStates.renaming_item)
+async def state_rename_item(message: Message, state: FSMContext, bot: Bot, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, message.from_user)
+    data = await state.get_data()
+    item_id = int(data.get("item_id", 0))
+    try:
+        item = await shopping.rename_item(session, user_id=user_id, item_id=item_id, title=message.text or "")
+        await session.commit()
+        await state.clear()
+        await _show_item(message, session, user_id, item.id)
+        await _broadcast_public_list_update(bot, session, item.list_id, exclude_user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(message, error)
+
+
+@router.callback_query(F.data.startswith("item_move:"))
+async def callback_item_move(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    item_id = _parse_id(query.data, "item_move:")
+    if item_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        shopping_list, item, level = await shopping.get_item_view(session, user_id=user_id, item_id=item_id)
+        if item.scope == shopping.ITEM_SCOPE_PERSONAL and level != AccessLevel.owner and item.personal_owner_id != user_id:
+            raise AccessDenied("Чужой личный раздел нельзя менять.")
+        _, categories, _ = await shopping.get_shopping_categories(session, user_id=user_id, list_id=shopping_list.id)
+        await _send_or_edit(
+            query,
+            f"<b>Перенести «{escape(item.text)}»</b>",
+            reply_markup=item_move_keyboard(item, categories, level=level, user_id=user_id),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("item_move_to:"))
+async def callback_item_move_to(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    ids = _parse_two_ids(query.data, "item_move_to:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    item_id, category_id = ids
+    try:
+        item = await shopping.move_item(session, user_id=user_id, item_id=item_id, category_id=category_id)
+        await session.commit()
+        await _show_item(query, session, user_id, item.id)
+        await _broadcast_public_list_update(bot, session, item.list_id, exclude_user_id=user_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -1811,7 +1932,7 @@ async def callback_add_items(query: CallbackQuery, state: FSMContext, session: A
         await _clear_current_list_view(query, session, user_id)
         await _send_or_edit(
             query,
-            "<b>Куда добавить?</b>\nВыбери раздел ниже. Личные разделы тоже видны участникам.",
+            "<b>Раздел для новых пунктов</b>\nЛичные разделы тоже видны участникам.",
             reply_markup=shopping_category_select_keyboard(shopping_list, visible_categories, user_id=user_id),
         )
     except LifeHelperError as error:
@@ -1894,7 +2015,13 @@ async def callback_toggle_item(
         await _answer_callback(query, "Не понял кнопку.", show_alert=True)
         return
     try:
-        _, item, _ = await shopping.get_item_view(session, user_id=user_id, item_id=item_id)
+        shopping_list, item, _ = await shopping.get_item_view(session, user_id=user_id, item_id=item_id)
+        if shopping_list.prices_enabled is False:
+            list_id = await shopping.toggle_item(session, user_id=user_id, item_id=item.id)
+            await session.commit()
+            await _show_list(query, session, user_id, list_id)
+            await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
+            return
         if item.is_done:
             receipt_view = await shopping.get_receipt_expense_for_item(session, user_id=user_id, item_id=item_id)
             if receipt_view is not None:
@@ -1906,6 +2033,13 @@ async def callback_toggle_item(
                 )
                 return
             list_id = await shopping.unmark_item(session, user_id=user_id, item_id=item_id)
+            await session.commit()
+            await _show_list(query, session, user_id, list_id)
+            await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
+            return
+
+        if await shopping.has_recorded_item_purchase(session, item):
+            list_id = await shopping.toggle_item(session, user_id=user_id, item_id=item.id)
             await session.commit()
             await _show_list(query, session, user_id, list_id)
             await _broadcast_public_list_update(bot, session, list_id, exclude_user_id=user_id)
@@ -2124,6 +2258,8 @@ async def _show_receipt_item_selection(
         user_id=user_id,
         category_id=category_id,
     )
+    if shopping_list.prices_enabled is False:
+        raise ValidationError("В этом списке выключен учёт денег.")
     if category.accounting_mode == shopping.SHOPPING_CATEGORY_MODE_CHECKLIST:
         raise ValidationError("В этой категории просто отмечаем вещи, без чеков и денег.")
     if category.accounting_mode != shopping.SHOPPING_CATEGORY_MODE_RECEIPT:
@@ -2931,6 +3067,63 @@ async def callback_settings(query: CallbackQuery, session: AsyncSession) -> None
         await _handle_service_error(query, error)
 
 
+@router.callback_query(F.data.startswith("list_mode:"))
+async def callback_list_mode(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "list_mode:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        shopping_list = await shopping.assert_owner(session, owner_id=user_id, list_id=list_id)
+        await _send_or_edit(
+            query,
+            f"<b>Режим · {escape(shopping_list.title)}</b>\n"
+            "Простой список: отметки без цен и денежных расчётов.\n"
+            "С деньгами: цены покупок, чеки, взносы и расчёты.\n\n"
+            "Существующие денежные записи сохраняются при переключении.",
+            reply_markup=list_mode_keyboard(shopping_list),
+        )
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("list_mode_set:"))
+async def callback_list_mode_set(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parts = (query.data or "").removeprefix("list_mode_set:").split(":")
+    if len(parts) != 2 or parts[1] not in {"on", "off"}:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id = int(parts[0])
+    except ValueError:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        shopping_list = await shopping.set_list_prices_enabled(
+            session, owner_id=user_id, list_id=list_id, enabled=parts[1] == "on"
+        )
+        await session.commit()
+        await _show_settings(query, session, user_id, shopping_list.id)
+        await _broadcast_public_list_update(bot, session, shopping_list.id, exclude_user_id=user_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("settings_access:"))
+async def callback_settings_access(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    list_id = _parse_id(query.data, "settings_access:")
+    if list_id is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await _show_access_settings(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
 @router.callback_query(F.data.startswith("share:"))
 async def callback_share(query: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
     user_id = await _ensure_user(session, query.from_user)
@@ -2944,7 +3137,7 @@ async def callback_share(query: CallbackQuery, bot: Bot, session: AsyncSession) 
         await _answer_callback(query)
         if query.message is not None:
             await query.message.answer(f"Ссылка для приглашения в список:\n{link}")
-        await _show_settings(query, session, user_id, list_id)
+        await _show_access_settings(query, session, user_id, list_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -2980,7 +3173,7 @@ async def callback_relink(query: CallbackQuery, bot: Bot, session: AsyncSession)
         await _answer_callback(query)
         if query.message is not None:
             await query.message.answer(f"Новая ссылка для приглашения:\n{link}\n\nСтарая ссылка больше не работает.")
-        await _show_settings(query, session, user_id, list_id)
+        await _show_access_settings(query, session, user_id, list_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -3013,7 +3206,7 @@ async def callback_private(query: CallbackQuery, session: AsyncSession) -> None:
         return
     try:
         await shopping.disable_public_access(session, owner_id=user_id, list_id=list_id)
-        await _show_settings(query, session, user_id, list_id)
+        await _show_access_settings(query, session, user_id, list_id)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -3088,4 +3281,4 @@ async def callback_delete_confirm(query: CallbackQuery, session: AsyncSession) -
 @router.message()
 async def fallback_message(message: Message, session: AsyncSession) -> None:
     await _ensure_user(session, message.from_user)
-    await message.answer("Выбери действие кнопкой ниже. Если нужна подсказка, отправь /help.", reply_markup=home_keyboard())
+    await message.answer("<b>Life Helper</b>", reply_markup=home_keyboard())

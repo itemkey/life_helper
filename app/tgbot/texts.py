@@ -16,36 +16,25 @@ from app.services.shopping import (
 
 
 WELCOME_TEXT = (
-    "Привет! Я Life Helper.\n\n"
-    "Помогу собрать покупки и вещи для общего дела и понять, кто сколько потратил. "
-    "Создай список или открой уже существующий."
+    "<b>Life Helper</b>\n"
+    "Общие и личные списки покупок и вещей. При необходимости — учёт денег."
 )
 
 HELP_TEXT = (
-    "<b>Как пользоваться</b>\n"
-    "1. Создай список или открой список по ссылке.\n"
-    "2. Нажми «Добавить», чтобы записать покупки или вещи. Разделы помогают их сгруппировать.\n"
-    "3. Нажми на пункт списка, чтобы отметить его. Для покупки бот попросит цену и способ оплаты.\n"
-    "4. В «Деньгах» записывай взносы и другие траты, смотри итог расчётов.\n\n"
-    "Общие и личные разделы видны участникам; обычно каждый добавляет в свой личный раздел. "
-    "Касса — общие деньги, «из кармана» — личная оплата. "
-    "Пригласить людей можно через «Настройки» → «Поделиться».\n\n"
+    "<b>Возможности</b>\n"
+    "Разделы группируют пункты списка. Личные разделы видны всем участникам, но менять их может владелец раздела или списка.\n\n"
+    "У каждого пункта есть отметка и свои настройки: название, раздел, удаление.\n\n"
+    "Список может работать без цен или с учётом денег. Во втором режиме доступны покупки по товарам и чекам, "
+    "взносы, траты и расчёты между участниками.\n\n"
+    "Ссылка для участников — в настройках списка.\n\n"
     "Команды: /lists — все списки, /new — новый список, /cancel — отменить ввод."
 )
 
 
 def format_lists_text(owned: Sequence[ShoppingList], shared: Sequence[ShoppingList]) -> str:
     if not owned and not shared:
-        return "Списков пока нет. Нажми «Создать список», чтобы начать."
-
-    lines = ["<b>Списки</b>", "Выбери список или создай новый."]
-    if owned:
-        lines.append("\nСозданные мной:")
-        lines.extend(f"- {escape(item.title)}" for item in owned)
-    if shared:
-        lines.append("\nПо приглашению:")
-        lines.extend(f"- {escape(item.title)}" for item in shared)
-    return "\n".join(lines)
+        return "<b>Списки</b>\nПока пусто"
+    return f"<b>Списки</b>\nМои: {len(owned)} · По приглашению: {len(shared)}"
 
 
 def format_list_text(
@@ -54,53 +43,13 @@ def format_list_text(
     level: AccessLevel,
     categories: Sequence[ShoppingCategory] = (),
 ) -> str:
-    visibility = "по ссылке" if shopping_list.is_public else "только для тебя"
-    lines = [
-        f"<b>{escape(shopping_list.title)}</b>",
-        f"Доступ: {visibility}.",
-        "",
-    ]
-    if not items:
-        lines.append("Здесь пока пусто. Нажми «Добавить», чтобы записать первую покупку или вещь.")
-        return "\n".join(lines)
-    lines.append("Нажми на пункт ниже, чтобы отметить его. Корзина рядом откроет удаление.")
-    lines.append("")
-
-    categorized_items: dict[int, list[ShoppingItem]] = {}
-    uncategorized_items: list[ShoppingItem] = []
-    for item in items:
-        if item.category_id is None:
-            uncategorized_items.append(item)
-        else:
-            categorized_items.setdefault(item.category_id, []).append(item)
-
-    shown_category_ids: set[int] = set()
-    ordered_categories = sorted(categories, key=lambda category: (category.scope != "common", category.position, category.id))
-    for category in ordered_categories:
-        category_items = categorized_items.get(category.id, [])
-        if not category_items:
-            continue
-        if shown_category_ids:
-            lines.append("")
-        lines.append(f"<b>{_format_shopping_category_heading(category)}</b>")
-        lines.extend(_format_item_lines(category_items))
-        shown_category_ids.add(category.id)
-
-    leftover_category_ids = [category_id for category_id in categorized_items if category_id not in shown_category_ids]
-    for category_id in leftover_category_ids:
-        if shown_category_ids:
-            lines.append("")
-        category_items = categorized_items[category_id]
-        category = category_items[0].category
-        lines.append(f"<b>{_format_shopping_category_heading(category) if category is not None else 'Покупки'}</b>")
-        lines.extend(_format_item_lines(category_items))
-        shown_category_ids.add(category_id)
-
-    if uncategorized_items:
-        if shown_category_ids:
-            lines.append("")
-        lines.append("<b>Без категории</b>")
-        lines.extend(_format_item_lines(uncategorized_items))
+    remaining = sum(not item.is_done for item in items)
+    mode = "Список без цен" if shopping_list.prices_enabled is False else "Список с учётом денег"
+    lines = [f"<b>{escape(shopping_list.title)}</b>", mode]
+    if items:
+        lines.append(f"Осталось: {remaining} из {len(items)}")
+    else:
+        lines.append("Пока пусто")
     return "\n".join(lines)
 
 
@@ -187,19 +136,19 @@ def format_members_management_text(
         lines.append("Участников по ссылке пока нет.")
         return "\n".join(lines)
 
-    lines.append("Выбери действие для участника:")
+    lines.append("Участники:")
     for index, (_, user) in enumerate(members, start=1):
         lines.append(f"{index}. {_format_user_name(user)}")
     return "\n".join(lines)
 
 
 def format_settings_text(shopping_list: ShoppingList) -> str:
-    visibility = "открыт по ссылке" if shopping_list.is_public else "закрыт"
+    visibility = "по ссылке" if shopping_list.is_public else "закрыт"
+    mode = "с учётом денег" if shopping_list.prices_enabled is not False else "без цен"
     return (
-        f"<b>Настройки списка</b>\n"
-        f"Название: {escape(shopping_list.title)}\n"
-        f"Доступ: {visibility}\n\n"
-        "Здесь можно пригласить участников, изменить название или удалить список."
+        f"<b>Настройки · {escape(shopping_list.title)}</b>\n"
+        f"Режим: {mode}\n"
+        f"Доступ: {visibility}"
     )
 
 
@@ -301,18 +250,7 @@ def format_categories_text(
     shopping_list: ShoppingList,
     categories: Sequence[ExpenseCategory],
 ) -> str:
-    lines = [
-        f"<b>Категории трат: {escape(shopping_list.title)}</b>",
-        "",
-    ]
-    if categories:
-        lines.append("Выбери категорию для новой траты или добавь свою.")
-        lines.append("")
-        for index, category in enumerate(categories, start=1):
-            lines.append(f"{index}. {escape(category.title)} — {_format_expense_split_label(category.default_split)}")
-    else:
-        lines.append("Категорий пока нет. Добавь любую: такси, маршрутка, автобус, доставка, билеты.")
-    return "\n".join(lines)
+    return f"<b>Категории трат · {escape(shopping_list.title)}</b>\nВсего: {len(categories)}"
 
 
 def _format_expense_split_label(default_split: str) -> str:
@@ -343,8 +281,6 @@ def format_expense_category_split_text(category: ExpenseCategory) -> str:
         [
             f"<b>Распределение: {escape(category.title)}</b>",
             f"Сейчас: {_format_expense_split_label(category.default_split)}",
-            "",
-            "Выбери, как обычно делить траты этой категории.",
         ]
     )
 
@@ -353,18 +289,7 @@ def format_shopping_categories_text(
     shopping_list: ShoppingList,
     categories: Sequence[ShoppingCategory],
 ) -> str:
-    lines = [
-        f"<b>Разделы: {escape(shopping_list.title)}</b>",
-        "Разделы группируют покупки и вещи. Общие доступны всем, личные — для отдельных участников.",
-        "",
-    ]
-    if not categories:
-        lines.append("Разделов пока нет. Создай общий или личный раздел.")
-        return "\n".join(lines)
-
-    for index, category in enumerate(categories, start=1):
-        lines.append(f"{index}. {_format_shopping_category_heading(category)}")
-    return "\n".join(lines)
+    return f"<b>Разделы · {escape(shopping_list.title)}</b>\nВсего: {len(categories)}"
 
 
 def format_shopping_category_text(
@@ -373,30 +298,36 @@ def format_shopping_category_text(
     *,
     can_add: bool = True,
 ) -> str:
-    lines = [
-        f"<b>{_format_shopping_category_heading(category)}</b>",
-        "",
-    ]
+    lines = [f"<b>{escape(category.title)}</b>"]
     if items:
-        lines.append("Чтобы отметить пункт, нажми «К списку» ниже.")
-        lines.append("")
-        lines.extend(_format_item_lines(items))
-    elif not can_add:
-        lines.append("Здесь пока пусто. Добавить пункты может владелец раздела.")
+        lines.append(f"Осталось: {sum(not item.is_done for item in items)} из {len(items)}")
     else:
-        lines.append("Здесь пока пусто. Нажми «Добавить» ниже.")
+        lines.append("Пока пусто")
     return "\n".join(lines)
 
 
-def format_shopping_category_settings_text(category: ShoppingCategory) -> str:
+def format_item_text(item: ShoppingItem) -> str:
+    category = item.category
+    section = escape(category.title) if category is not None else "Без раздела"
+    return "\n".join(
+        [
+            f"<b>{escape(item.text)}</b>",
+            f"Раздел: {section}",
+            f"Статус: {'готово' if item.is_done else 'не отмечено'}",
+        ]
+    )
+
+
+def format_shopping_category_settings_text(category: ShoppingCategory, *, prices_enabled: bool = True) -> str:
     lines = [
-        f"<b>Настройки: {_format_shopping_category_heading(category)}</b>",
-        "",
-        f"Тип: {_format_shopping_category_kind(category.accounting_mode)}.",
+        f"<b>Настройки раздела · {escape(category.title)}</b>",
     ]
+    if not prices_enabled:
+        return "\n".join(lines)
+    lines.append(f"Тип: {_format_shopping_category_kind(category.accounting_mode)}")
     accounting = _format_shopping_category_accounting(category.accounting_mode)
     if accounting is not None:
-        lines.append(f"Расчёт: {accounting}.")
+        lines.append(f"Расчёт: {accounting}")
     return "\n".join(
         lines
     )
@@ -407,18 +338,7 @@ def format_receipt_items_text(
     items: Sequence[ShoppingItem],
     selected_item_ids: Sequence[int],
 ) -> str:
-    selected = set(selected_item_ids)
-    lines = [
-        f"<b>Чек: {_format_shopping_category_heading(category)}</b>",
-        "",
-    ]
-    if not items:
-        lines.append("В этом разделе нет некупленных товаров для чека.")
-        return "\n".join(lines)
-    for index, item in enumerate(items, start=1):
-        mark = "✓" if item.id in selected else "□"
-        lines.append(f"{index}. {mark} {escape(item.text)}")
-    return "\n".join(lines)
+    return f"<b>Чек · {escape(category.title)}</b>\nВыбрано: {len(selected_item_ids)} из {len(items)}"
 
 
 def format_money_final_text(summary: MoneySummary) -> str:

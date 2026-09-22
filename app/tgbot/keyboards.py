@@ -34,7 +34,7 @@ def home_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Открыть списки", callback_data="lists")],
             [InlineKeyboardButton(text="Создать список", callback_data="new")],
-            [InlineKeyboardButton(text="Как пользоваться", callback_data="help")],
+            [InlineKeyboardButton(text="Возможности", callback_data="help")],
         ]
     )
 
@@ -72,26 +72,102 @@ def list_keyboard(
     items: Sequence[ShoppingItem],
     level: AccessLevel,
     user_id: int | None = None,
+    categories: Sequence[ShoppingCategory] = (),
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    rows.append([InlineKeyboardButton(text="＋ Добавить", callback_data=f"add:{shopping_list.id}")])
+    items_by_category: dict[int, list[ShoppingItem]] = {}
+    uncategorized: list[ShoppingItem] = []
     for item in items:
-        mark = "✓" if item.is_done else "□"
-        row = [InlineKeyboardButton(text=f"{mark} {_short(item.text, 34)}", callback_data=f"toggle:{item.id}")]
-        can_delete = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
-        if can_delete:
-            row.append(InlineKeyboardButton(text="🗑", callback_data=f"delitem_ask:{item.id}"))
-        rows.append(row)
+        if item.category_id is None:
+            uncategorized.append(item)
+        else:
+            items_by_category.setdefault(item.category_id, []).append(item)
 
+    for category in sorted(categories, key=lambda entry: (entry.scope != "common", entry.position, entry.id)):
+        category_items = items_by_category.pop(category.id, [])
+        title = _short(category.title, 34)
+        if category.scope == "personal":
+            owner = _user_label(category.owner) if category.owner else f"ID {category.owner_id}"
+            title = f"👤 Мой · {title}" if category.owner_id == user_id else f"👤 {owner} · {title}"
+        else:
+            title = f"📁 {title}"
+        if shopping_list.prices_enabled is not False:
+            mode = {"receipt": "по чеку", "checklist": "без цен"}.get(category.accounting_mode, "по товарам")
+            title = _short(f"{title} · {mode}", 56)
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"shopping_category:{category.id}")])
+        for item in sorted(category_items, key=lambda entry: (entry.is_done, entry.position, entry.id)):
+            can_toggle = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
+            rows.append(_item_buttons(item, shopping_list.prices_enabled is not False, can_toggle=can_toggle))
+        if category.scope == "common" or level == AccessLevel.owner or category.owner_id == user_id:
+            rows.append([InlineKeyboardButton(text="＋ Добавить сюда", callback_data=f"add_category:{category.id}")])
+
+    remaining_items = [*uncategorized, *(item for group in items_by_category.values() for item in group)]
+    if remaining_items:
+        rows.append([InlineKeyboardButton(text="📁 Без раздела", callback_data=f"shopping_categories:{shopping_list.id}")])
+        for item in sorted(remaining_items, key=lambda entry: (entry.is_done, entry.position, entry.id)):
+            can_toggle = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
+            rows.append(_item_buttons(item, shopping_list.prices_enabled is not False, can_toggle=can_toggle))
+
+    rows.append([InlineKeyboardButton(text="＋ Добавить пункт", callback_data=f"add:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Разделы", callback_data=f"shopping_categories:{shopping_list.id}")])
-    rows.append([InlineKeyboardButton(text="Деньги", callback_data=f"money:{shopping_list.id}")])
+    if shopping_list.prices_enabled is not False:
+        rows.append([InlineKeyboardButton(text="Деньги", callback_data=f"money:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Участники", callback_data=f"members:{shopping_list.id}")])
     if level == AccessLevel.owner:
-        rows.append([InlineKeyboardButton(text="Настройки", callback_data=f"settings:{shopping_list.id}")])
+        rows.append([InlineKeyboardButton(text="⚙️ Настройки списка", callback_data=f"settings:{shopping_list.id}")])
     rows.append([
         InlineKeyboardButton(text="↻ Обновить", callback_data=f"refresh:{shopping_list.id}"),
         InlineKeyboardButton(text="Все списки", callback_data="lists"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _item_buttons(item: ShoppingItem, prices_enabled: bool, *, can_toggle: bool = True) -> list[InlineKeyboardButton]:
+    mark = "✓" if item.is_done else "□"
+    callback = f"item_open:{item.id}" if not can_toggle or (prices_enabled and item.category is not None and item.category.accounting_mode == "receipt") else f"toggle:{item.id}"
+    label = f"🔒 {_short(item.text, 34)}" if not can_toggle else f"{mark} {_short(item.text, 34)}"
+    return [
+        InlineKeyboardButton(text=label, callback_data=callback),
+        InlineKeyboardButton(text="⚙️", callback_data=f"item_open:{item.id}"),
+    ]
+
+
+def item_keyboard(shopping_list: ShoppingList, item: ShoppingItem, *, can_edit: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_edit:
+        if item.is_done:
+            rows.append([InlineKeyboardButton(text="Снять отметку", callback_data=f"toggle:{item.id}")])
+        elif shopping_list.prices_enabled is False or item.expense_links or item.expenses or (item.category is not None and item.category.accounting_mode == "checklist"):
+            rows.append([InlineKeyboardButton(text="Отметить готовым", callback_data=f"toggle:{item.id}")])
+        elif item.category is not None and item.category.accounting_mode == "receipt":
+            rows.append([InlineKeyboardButton(text="Добавить в чек", callback_data=f"receipt:{item.category.id}")])
+        else:
+            rows.append([InlineKeyboardButton(text="Купить и записать цену", callback_data=f"toggle:{item.id}")])
+        rows.append([InlineKeyboardButton(text="Переименовать", callback_data=f"item_rename:{item.id}")])
+        if not item.is_done:
+            rows.append([InlineKeyboardButton(text="Перенести в другой раздел", callback_data=f"item_move:{item.id}")])
+        rows.append([InlineKeyboardButton(text="Удалить пункт", callback_data=f"delitem_ask:{item.id}")])
+    if item.category_id is not None:
+        rows.append([InlineKeyboardButton(text="К разделу", callback_data=f"shopping_category:{item.category_id}")])
+    rows.append([InlineKeyboardButton(text="К списку", callback_data=f"open:{item.list_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def item_move_keyboard(
+    item: ShoppingItem,
+    categories: Sequence[ShoppingCategory],
+    *,
+    level: AccessLevel,
+    user_id: int,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=_shopping_category_label(category, current_user_id=user_id), callback_data=f"item_move_to:{item.id}:{category.id}")]
+        for category in categories
+        if category.id != item.category_id
+        and (category.scope == "common" or level == AccessLevel.owner or category.owner_id == user_id)
+    ]
+    rows.append([InlineKeyboardButton(text="Разделы списка", callback_data=f"shopping_categories:{item.list_id}")])
+    rows.append([InlineKeyboardButton(text="Назад к пункту", callback_data=f"item_open:{item.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -147,14 +223,19 @@ def shopping_category_keyboard(
     category: ShoppingCategory,
     level: AccessLevel,
     user_id: int,
+    items: Sequence[ShoppingItem] = (),
+    *,
+    prices_enabled: bool = True,
 ) -> InlineKeyboardMarkup:
     can_edit = level == AccessLevel.owner or (category.scope == "personal" and category.owner_id == user_id)
     can_add = category.scope == "common" or can_edit
-    add_label = "＋ Добавить вещь" if category.accounting_mode == "checklist" else "＋ Добавить товар"
+    add_label = "＋ Добавить пункт" if not prices_enabled else ("＋ Добавить вещь" if category.accounting_mode == "checklist" else "＋ Добавить товар")
     rows: list[list[InlineKeyboardButton]] = []
     if can_add:
         rows.append([InlineKeyboardButton(text=add_label, callback_data=f"add_category:{category.id}")])
-    if category.accounting_mode == "receipt":
+    for item in sorted(items, key=lambda entry: (entry.is_done, entry.position, entry.id)):
+        rows.append(_item_buttons(item, prices_enabled, can_toggle=can_edit or item.scope != "personal"))
+    if prices_enabled and category.accounting_mode == "receipt":
         rows.append([InlineKeyboardButton(text="Записать чек", callback_data=f"receipt:{category.id}")])
     if can_edit:
         rows.append([InlineKeyboardButton(text="Настройки", callback_data=f"shopping_category_settings:{category.id}")])
@@ -169,6 +250,8 @@ def shopping_category_settings_keyboard(
     category: ShoppingCategory,
     level: AccessLevel,
     user_id: int,
+    *,
+    prices_enabled: bool = True,
 ) -> InlineKeyboardMarkup:
     can_edit = level == AccessLevel.owner or (category.scope == "personal" and category.owner_id == user_id)
     rows: list[list[InlineKeyboardButton]] = []
@@ -181,10 +264,11 @@ def shopping_category_settings_keyboard(
             ),
             ("checklist", "Список вещей", category.accounting_mode == "checklist"),
         ]
-        for mode, label, is_selected in mode_buttons:
-            mark = "✓ " if is_selected else ""
-            rows.append([InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"shopping_category_mode:{category.id}:{mode}")])
-        if category.accounting_mode != "checklist":
+        if prices_enabled:
+            for mode, label, is_selected in mode_buttons:
+                mark = "✓ " if is_selected else ""
+                rows.append([InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"shopping_category_mode:{category.id}:{mode}")])
+        if prices_enabled and category.accounting_mode != "checklist":
             accounting_buttons = [
                 ("per_item", "По товарам"),
                 ("receipt", "По чеку"),
@@ -699,18 +783,38 @@ def member_action_confirm_keyboard(list_id: int, member_user_id: int, *, action:
 
 
 def settings_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Режим списка", callback_data=f"list_mode:{shopping_list.id}")],
+            [InlineKeyboardButton(text="Участники и доступ", callback_data=f"settings_access:{shopping_list.id}")],
+            [InlineKeyboardButton(text="Переименовать список", callback_data=f"rename:{shopping_list.id}")],
+            [InlineKeyboardButton(text="Удалить список", callback_data=f"delete_list:{shopping_list.id}")],
+            [InlineKeyboardButton(text="К списку", callback_data=f"open:{shopping_list.id}")],
+        ]
+    )
+
+
+def list_mode_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
+    enabled = shopping_list.prices_enabled is not False
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{'✓ ' if not enabled else ''}Простой список · без цен", callback_data=f"list_mode_set:{shopping_list.id}:off")],
+            [InlineKeyboardButton(text=f"{'✓ ' if enabled else ''}Список с деньгами", callback_data=f"list_mode_set:{shopping_list.id}:on")],
+            [InlineKeyboardButton(text="Назад к настройкам", callback_data=f"settings:{shopping_list.id}")],
+        ]
+    )
+
+
+def access_settings_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
     share_label = "Показать ссылку" if shopping_list.is_public else "Пригласить по ссылке"
-    rows = [[InlineKeyboardButton(text=share_label, callback_data=f"share:{shopping_list.id}")]]
+    rows = [
+        [InlineKeyboardButton(text=share_label, callback_data=f"share:{shopping_list.id}")],
+        [InlineKeyboardButton(text="Участники", callback_data=f"members:{shopping_list.id}")],
+    ]
     if shopping_list.is_public:
         rows.append([InlineKeyboardButton(text="Заменить ссылку", callback_data=f"relink_ask:{shopping_list.id}")])
         rows.append([InlineKeyboardButton(text="Закрыть доступ", callback_data=f"private_ask:{shopping_list.id}")])
-    rows.extend(
-        [
-            [InlineKeyboardButton(text="Переименовать", callback_data=f"rename:{shopping_list.id}")],
-            [InlineKeyboardButton(text="Удалить список", callback_data=f"delete_list:{shopping_list.id}")],
-            [InlineKeyboardButton(text="Назад к списку", callback_data=f"open:{shopping_list.id}")],
-        ]
-    )
+    rows.append([InlineKeyboardButton(text="Назад к настройкам", callback_data=f"settings:{shopping_list.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -720,7 +824,7 @@ def access_change_confirm_keyboard(shopping_list: ShoppingList, *, action: str) 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Да, продолжить", callback_data=f"{action}:{shopping_list.id}")],
-            [InlineKeyboardButton(text="Отмена", callback_data=f"settings:{shopping_list.id}")],
+            [InlineKeyboardButton(text="Отмена", callback_data=f"settings_access:{shopping_list.id}")],
         ]
     )
 

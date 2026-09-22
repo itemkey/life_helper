@@ -15,7 +15,9 @@ from app.tgbot.keyboards import (
     expense_source_keyboard,
     expense_split_keyboard,
     item_purchase_source_keyboard,
+    item_keyboard,
     list_keyboard,
+    list_mode_keyboard,
     members_keyboard,
     members_management_keyboard,
     money_keyboard,
@@ -53,12 +55,60 @@ def test_list_keyboard_has_categories_and_money_buttons():
     keyboard = list_keyboard(shopping_list, [], AccessLevel.member)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.text == "＋ Добавить" and button.callback_data == "add:1" for button in buttons)
+    assert any(button.text == "＋ Добавить пункт" and button.callback_data == "add:1" for button in buttons)
     assert any(
         button.text == "Разделы" and button.callback_data == "shopping_categories:1"
         for button in buttons
     )
     assert any(button.text == "Деньги" and button.callback_data == "money:1" for button in buttons)
+
+
+def test_list_keyboard_groups_items_under_sections_with_each_item_settings():
+    shopping_list = ShoppingList(id=1, owner_id=100, title="Дом", prices_enabled=True)
+    food = ShoppingCategory(id=10, list_id=1, title="Продукты", scope="common", position=1, accounting_mode="per_item")
+    trip = ShoppingCategory(id=11, list_id=1, title="Поездка", scope="common", position=2, accounting_mode="checklist")
+    milk = ShoppingItem(id=20, list_id=1, category_id=10, category=food, text="Молоко", position=1, scope="common", is_done=False)
+    towel = ShoppingItem(id=21, list_id=1, category_id=11, category=trip, text="Полотенце", position=2, scope="common", is_done=False)
+
+    keyboard = list_keyboard(shopping_list, [towel, milk], AccessLevel.owner, user_id=100, categories=[trip, food])
+    rows = keyboard.inline_keyboard
+    callbacks = [[button.callback_data for button in row] for row in rows]
+    assert callbacks[:6] == [
+        ["shopping_category:10"], ["toggle:20", "item_open:20"], ["add_category:10"],
+        ["shopping_category:11"], ["toggle:21", "item_open:21"], ["add_category:11"],
+    ]
+
+
+def test_simple_mode_hides_money_and_receipts_but_keeps_item_actions():
+    shopping_list = ShoppingList(id=1, owner_id=100, title="Дом", prices_enabled=False)
+    category = ShoppingCategory(id=10, list_id=1, title="Продукты", scope="common", position=1, accounting_mode="receipt")
+    item = ShoppingItem(id=20, list_id=1, category_id=10, category=category, text="Молоко", position=1, scope="common", is_done=False)
+
+    main_buttons = [button for row in list_keyboard(shopping_list, [item], AccessLevel.owner, user_id=100, categories=[category]).inline_keyboard for button in row]
+    section_buttons = [button for row in shopping_category_keyboard(category, AccessLevel.owner, 100, [item], prices_enabled=False).inline_keyboard for button in row]
+    settings_buttons = [button for row in shopping_category_settings_keyboard(category, AccessLevel.owner, 100, prices_enabled=False).inline_keyboard for button in row]
+    mode_buttons = [button for row in list_mode_keyboard(shopping_list).inline_keyboard for button in row]
+    item_buttons = [button for row in item_keyboard(shopping_list, item, can_edit=True).inline_keyboard for button in row]
+
+    assert any(button.callback_data == "toggle:20" for button in main_buttons)
+    assert not any(button.callback_data == "money:1" for button in main_buttons)
+    assert not any(button.callback_data == "receipt:10" for button in section_buttons)
+    assert not any(button.callback_data.startswith("shopping_category_mode:") for button in settings_buttons)
+    assert any(button.text.startswith("✓ Простой список") for button in mode_buttons)
+    assert any(button.callback_data == "toggle:20" and button.text == "Отметить готовым" for button in item_buttons)
+
+
+def test_other_members_personal_item_is_read_only_in_buttons():
+    shopping_list = ShoppingList(id=1, owner_id=100, title="Дом", prices_enabled=False)
+    category = ShoppingCategory(id=10, list_id=1, title="Личное", scope="personal", owner_id=200, position=1, accounting_mode="per_item")
+    item = ShoppingItem(id=20, list_id=1, category_id=10, category=category, text="Книга", position=1, scope="personal", personal_owner_id=200, is_done=False)
+
+    main_buttons = [button for row in list_keyboard(shopping_list, [item], AccessLevel.member, user_id=300, categories=[category]).inline_keyboard for button in row]
+    detail_buttons = [button for row in item_keyboard(shopping_list, item, can_edit=False).inline_keyboard for button in row]
+
+    assert any(button.text.startswith("🔒 Книга") and button.callback_data == "item_open:20" for button in main_buttons)
+    assert not any(button.callback_data == "toggle:20" for button in main_buttons + detail_buttons)
+    assert not any(button.callback_data == "item_rename:20" for button in detail_buttons)
 
 
 def test_add_chooser_keeps_personal_path_visible_with_only_common_section():

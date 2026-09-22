@@ -6,6 +6,7 @@ class ShoppingListStates(StatesGroup):
     adding_items = State()
     adding_shopping_category_title = State()
     renaming_shopping_category = State()
+    renaming_item = State()
     choosing_receipt_items = State()
     adding_receipt_amount = State()
     buying_item_amount = State()
