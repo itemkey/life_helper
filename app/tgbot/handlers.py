@@ -13,13 +13,16 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.deep_linking import create_start_link
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services import shopping
+from app.services import audit, shopping
 from app.services.access import AccessLevel
 from app.services.errors import AccessDenied, LifeHelperError, ListNotFound, ValidationError
 from app.tgbot.keyboards import (
     EXPENSE_DELETE_PAGE_SIZE,
     access_settings_keyboard,
     access_change_confirm_keyboard,
+    audit_keyboard,
+    audit_items_keyboard,
+    audit_sections_keyboard,
     cancel_keyboard,
     delete_confirm_keyboard,
     expense_categories_keyboard,
@@ -41,6 +44,7 @@ from app.tgbot.keyboards import (
     item_move_keyboard,
     item_purchase_source_keyboard,
     list_keyboard,
+    list_text_keyboard,
     list_mode_keyboard,
     lists_keyboard,
     member_action_confirm_keyboard,
@@ -62,11 +66,13 @@ from app.tgbot.texts import (
     HELP_TEXT,
     WELCOME_TEXT,
     format_categories_text,
+    format_audit_text,
     format_expense_category_split_text,
     format_expense_category_text,
     format_expense_management_text,
     format_item_text,
     format_list_text,
+    format_full_list_pages,
     format_lists_text,
     format_money_final_text,
     format_money_text,
@@ -84,6 +90,7 @@ logger = logging.getLogger(__name__)
 
 
 async def _ensure_user(session: AsyncSession, event_user: Any) -> int:
+    session.info["audit_actor_id"] = int(event_user.id)
     user = await shopping.upsert_user(session, event_user)
     return user.id
 
@@ -213,10 +220,12 @@ async def _show_lists(target: Message | CallbackQuery, session: AsyncSession, us
 async def _show_list(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
     shopping_list, items, level = await shopping.get_list_view(session, user_id=user_id, list_id=list_id)
     _, categories, _ = await shopping.get_shopping_categories(session, user_id=user_id, list_id=list_id)
+    collapsed = await shopping.get_collapsed_sections(session, user_id=user_id, list_id=list_id)
     sent_message = await _send_or_edit(
         target,
         format_list_text(shopping_list, items, level, categories),
-        reply_markup=list_keyboard(shopping_list, items, level, user_id=user_id, categories=categories),
+        reply_markup=list_keyboard(shopping_list, items, level, user_id=user_id, categories=categories,
+                                   collapsed_category_ids=collapsed),
     )
     identity = _message_identity(sent_message)
     if identity is not None:
@@ -260,6 +269,8 @@ async def _show_expense_management_list(
             f"<b>Управление тратами: {escape(summary.shopping_list.title)}</b>\n\n"
             f"Страница {current_page + 1} из {total_pages}"
         )
+
+
     else:
         text = f"<b>Управление тратами: {escape(summary.shopping_list.title)}</b>\n\nТрат пока нет."
     await _send_or_edit(
@@ -270,6 +281,21 @@ async def _show_expense_management_list(
             expenses,
             page=current_page,
         ),
+    )
+
+
+async def _show_list_text(
+    target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int, page: int
+) -> None:
+    shopping_list, items, _ = await shopping.get_list_view(session, user_id=user_id, list_id=list_id)
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=user_id, list_id=list_id)
+    pages = format_full_list_pages(shopping_list, items, categories, user_id=user_id)
+    current_page = min(max(page, 0), len(pages) - 1)
+    await _clear_current_list_view(target, session, user_id)
+    await _send_or_edit(
+        target,
+        pages[current_page],
+        reply_markup=list_text_keyboard(list_id, page=current_page, total_pages=len(pages)),
     )
 
 
@@ -418,6 +444,34 @@ async def _show_settings(target: Message | CallbackQuery, session: AsyncSession,
     await _clear_current_list_view(target, session, user_id)
     shopping_list = await shopping.assert_owner(session, owner_id=user_id, list_id=list_id)
     await _send_or_edit(target, format_settings_text(shopping_list), reply_markup=settings_keyboard(shopping_list))
+
+
+async def _show_audit(target: Message | CallbackQuery, session: AsyncSession, user_id: int,
+                      list_id: int, filter_name: str, page: int, section_id: int | None = None,
+                      item_id: int | None = None) -> None:
+    await _clear_current_list_view(target, session, user_id)
+    shopping_list, entries, total, actors = await audit.get_page(
+        session, owner_id=user_id, list_id=list_id, filter_name=filter_name,
+        page=page, section_id=None if item_id is not None else section_id,
+        item_id=item_id,
+    )
+    page = min(max(page, 0), max((total - 1) // audit.PAGE_SIZE, 0))
+    section_title = None
+    if item_id is not None:
+        _, items = await audit.get_items(session, owner_id=user_id, list_id=list_id, section_id=section_id)
+        item_title = next((title for ident, title in items if ident == item_id),
+                          entries[0].subject_title if entries else f"Пункт #{item_id}")
+        section_title = f"Пункт «{item_title}»"
+    elif section_id is not None:
+        _, sections = await audit.get_sections(session, owner_id=user_id, list_id=list_id)
+        section_title = next((title for ident, title in sections if ident == section_id), f"Раздел #{section_id}")
+    await _send_or_edit(
+        target,
+        format_audit_text(shopping_list, entries, actors, total=total, page=page,
+                          filter_name=filter_name, section_title=section_title),
+        reply_markup=audit_keyboard(list_id, filter_name=filter_name, page=page,
+                                    total=total, section_id=section_id, item_id=item_id),
+    )
 
 
 async def _show_access_settings(target: Message | CallbackQuery, session: AsyncSession, user_id: int, list_id: int) -> None:
@@ -588,11 +642,15 @@ async def _broadcast_public_list_update(
 
         level = AccessLevel.owner if view_message.user_id == shopping_list.owner_id else AccessLevel.member
         try:
+            collapsed = await shopping.get_collapsed_sections(
+                session, user_id=view_message.user_id, list_id=list_id
+            )
             await bot.edit_message_text(
                 text=format_list_text(shopping_list, items, level, categories),
                 chat_id=view_message.chat_id,
                 message_id=view_message.message_id,
-                reply_markup=list_keyboard(shopping_list, items, level, user_id=view_message.user_id, categories=categories),
+                reply_markup=list_keyboard(shopping_list, items, level, user_id=view_message.user_id,
+                                           categories=categories, collapsed_category_ids=collapsed),
             )
         except TelegramBadRequest as error:
             if "message is not modified" in str(error).lower():
@@ -731,6 +789,59 @@ async def callback_refresh_list(query: CallbackQuery, session: AsyncSession) -> 
         return
     try:
         await _show_list(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("section_toggle:"))
+async def callback_section_toggle(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    ids = _parse_two_ids(query.data, "section_toggle:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    list_id, category_id = ids
+    try:
+        collapsed = await shopping.get_collapsed_sections(session, user_id=user_id, list_id=list_id)
+        await shopping.set_section_collapsed(session, user_id=user_id, list_id=list_id,
+                                             category_id=category_id, collapsed=category_id not in collapsed)
+        await _show_list(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("section_toggle_all:"))
+async def callback_section_toggle_all(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    value = (query.data or "").removeprefix("section_toggle_all:")
+    parts = value.split(":")
+    if len(parts) != 2 or parts[1] not in {"collapse", "expand"}:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id = int(parts[0])
+    except ValueError:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        await shopping.set_all_sections_collapsed(
+            session, user_id=user_id, list_id=list_id, collapsed=parts[1] == "collapse"
+        )
+        await _show_list(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("list_text:"))
+async def callback_list_text(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    ids = _parse_two_ids(query.data, "list_text:")
+    if ids is None:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    list_id, page = ids
+    try:
+        await _show_list_text(query, session, user_id, list_id, page)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 
@@ -3063,6 +3174,101 @@ async def callback_settings(query: CallbackQuery, session: AsyncSession) -> None
         return
     try:
         await _show_settings(query, session, user_id, list_id)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("audit:"))
+async def callback_audit(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parts = (query.data or "").split(":")
+    if len(parts) != 4 or parts[2] not in audit.FILTERS:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id, page = int(parts[1]), int(parts[3])
+        await _show_audit(query, session, user_id, list_id, parts[2], page)
+    except ValueError:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("audit_sections:"))
+async def callback_audit_sections(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id, page = int(parts[1]), int(parts[2])
+        await _clear_current_list_view(query, session, user_id)
+        shopping_list, sections = await audit.get_sections(session, owner_id=user_id, list_id=list_id)
+        page = min(max(page, 0), max((len(sections) - 1) // 10, 0))
+        await _send_or_edit(query, f"<b>История по разделам · {escape(shopping_list.title)}</b>\n"
+                                 f"Разделов: {len(sections)}",
+                            reply_markup=audit_sections_keyboard(list_id, sections, page=page))
+    except ValueError:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("audit_section:"))
+async def callback_audit_section(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id, section_id, page = int(parts[1]), int(parts[2]), int(parts[3])
+        await _show_audit(query, session, user_id, list_id, "items", page, section_id=section_id)
+    except ValueError:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("audit_items:"))
+async def callback_audit_items(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id, section_id, page = int(parts[1]), int(parts[2]), int(parts[3])
+        await _clear_current_list_view(query, session, user_id)
+        shopping_list, items = await audit.get_items(session, owner_id=user_id, list_id=list_id,
+                                                    section_id=section_id)
+        _, sections = await audit.get_sections(session, owner_id=user_id, list_id=list_id)
+        section_title = next((title for ident, title in sections if ident == section_id),
+                             f"Раздел #{section_id}")
+        page = min(max(page, 0), max((len(items) - 1) // 10, 0))
+        await _send_or_edit(query, f"<b>История пунктов · {escape(shopping_list.title)}</b>\n"
+                                 f"Раздел: {escape(section_title)}\nПунктов: {len(items)}",
+                            reply_markup=audit_items_keyboard(list_id, section_id, items, page=page))
+    except ValueError:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+    except LifeHelperError as error:
+        await _handle_service_error(query, error)
+
+
+@router.callback_query(F.data.startswith("audit_item:"))
+async def callback_audit_item(query: CallbackQuery, session: AsyncSession) -> None:
+    user_id = await _ensure_user(session, query.from_user)
+    parts = (query.data or "").split(":")
+    if len(parts) != 5:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
+        return
+    try:
+        list_id, section_id, item_id, page = map(int, parts[1:])
+        await _show_audit(query, session, user_id, list_id, "items", page,
+                          section_id=section_id, item_id=item_id)
+    except ValueError:
+        await _answer_callback(query, "Не понял кнопку.", show_alert=True)
     except LifeHelperError as error:
         await _handle_service_error(query, error)
 

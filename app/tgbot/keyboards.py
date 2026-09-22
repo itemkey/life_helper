@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.db.models import Expense, ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
+from app.services.audit import PAGE_SIZE as AUDIT_PAGE_SIZE
 from app.services.access import AccessLevel
 
 
@@ -73,6 +74,7 @@ def list_keyboard(
     level: AccessLevel,
     user_id: int | None = None,
     categories: Sequence[ShoppingCategory] = (),
+    collapsed_category_ids: frozenset[int] | set[int] = frozenset(),
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     items_by_category: dict[int, list[ShoppingItem]] = {}
@@ -83,8 +85,10 @@ def list_keyboard(
         else:
             items_by_category.setdefault(item.category_id, []).append(item)
 
-    for category in sorted(categories, key=lambda entry: (entry.scope != "common", entry.position, entry.id)):
+    ordered_categories = sorted(categories, key=lambda entry: (entry.scope != "common", entry.position, entry.id))
+    for category in ordered_categories:
         category_items = items_by_category.pop(category.id, [])
+        is_collapsed = category.id in collapsed_category_ids
         title = _short(category.title, 34)
         if category.scope == "personal":
             owner = _user_label(category.owner) if category.owner else f"ID {category.owner_id}"
@@ -94,7 +98,17 @@ def list_keyboard(
         if shopping_list.prices_enabled is not False:
             mode = {"receipt": "по чеку", "checklist": "без цен"}.get(category.accounting_mode, "по товарам")
             title = _short(f"{title} · {mode}", 56)
-        rows.append([InlineKeyboardButton(text=title, callback_data=f"shopping_category:{category.id}")])
+        remaining = sum(not item.is_done for item in category_items)
+        count = f"{remaining}/{len(category_items)}"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{'▸' if is_collapsed else '▾'} {_short(title, 48 - len(count))} · {count}",
+                callback_data=f"section_toggle:{shopping_list.id}:{category.id}",
+            ),
+            InlineKeyboardButton(text="⚙️", callback_data=f"shopping_category:{category.id}"),
+        ])
+        if is_collapsed:
+            continue
         for item in sorted(category_items, key=lambda entry: (entry.is_done, entry.position, entry.id)):
             can_toggle = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
             rows.append(_item_buttons(item, shopping_list.prices_enabled is not False, can_toggle=can_toggle))
@@ -108,6 +122,12 @@ def list_keyboard(
             can_toggle = item.scope != "personal" or level == AccessLevel.owner or item.personal_owner_id == user_id
             rows.append(_item_buttons(item, shopping_list.prices_enabled is not False, can_toggle=can_toggle))
 
+    if ordered_categories:
+        all_collapsed = all(category.id in collapsed_category_ids for category in ordered_categories)
+        action = "expand" if all_collapsed else "collapse"
+        label = "Развернуть все" if all_collapsed else "Свернуть все"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"section_toggle_all:{shopping_list.id}:{action}")])
+    rows.append([InlineKeyboardButton(text="📄 Список текстом", callback_data=f"list_text:{shopping_list.id}:0")])
     rows.append([InlineKeyboardButton(text="＋ Добавить пункт", callback_data=f"add:{shopping_list.id}")])
     rows.append([InlineKeyboardButton(text="Разделы", callback_data=f"shopping_categories:{shopping_list.id}")])
     if shopping_list.prices_enabled is not False:
@@ -119,6 +139,19 @@ def list_keyboard(
         InlineKeyboardButton(text="↻ Обновить", callback_data=f"refresh:{shopping_list.id}"),
         InlineKeyboardButton(text="Все списки", callback_data="lists"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def list_text_keyboard(list_id: int, *, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if total_pages > 1:
+        pages: list[InlineKeyboardButton] = []
+        if page > 0:
+            pages.append(InlineKeyboardButton(text="←", callback_data=f"list_text:{list_id}:{page - 1}"))
+        if page + 1 < total_pages:
+            pages.append(InlineKeyboardButton(text="→", callback_data=f"list_text:{list_id}:{page + 1}"))
+        rows.append(pages)
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=f"open:{list_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -786,12 +819,82 @@ def settings_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Режим списка", callback_data=f"list_mode:{shopping_list.id}")],
+            [InlineKeyboardButton(text="Журнал аудита", callback_data=f"audit:{shopping_list.id}:all:0")],
             [InlineKeyboardButton(text="Участники и доступ", callback_data=f"settings_access:{shopping_list.id}")],
             [InlineKeyboardButton(text="Переименовать список", callback_data=f"rename:{shopping_list.id}")],
             [InlineKeyboardButton(text="Удалить список", callback_data=f"delete_list:{shopping_list.id}")],
             [InlineKeyboardButton(text="К списку", callback_data=f"open:{shopping_list.id}")],
         ]
     )
+
+
+def audit_keyboard(list_id: int, *, filter_name: str, page: int, total: int,
+                   section_id: int | None = None, item_id: int | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if section_id is None and item_id is None:
+        filters = [("all", "Все"), ("items", "Разделы и пункты"),
+                   ("money", "Деньги"), ("people", "Участники"), ("list", "Список")]
+        for key, title in filters:
+            rows.append([InlineKeyboardButton(text=f"{'✓ ' if filter_name == key else ''}{title}",
+                                            callback_data=f"audit:{list_id}:{key}:0")])
+        rows.append([InlineKeyboardButton(text="История по разделам", callback_data=f"audit_sections:{list_id}:0")])
+    elif item_id is None:
+        rows.append([InlineKeyboardButton(text="Пункты этого раздела", callback_data=f"audit_items:{list_id}:{section_id}:0")])
+    pages = max(1, (total + AUDIT_PAGE_SIZE - 1) // AUDIT_PAGE_SIZE)
+    navigation = []
+    if item_id is not None:
+        prefix = f"audit_item:{list_id}:{section_id}:{item_id}"
+    elif section_id is not None:
+        prefix = f"audit_section:{list_id}:{section_id}"
+    else:
+        prefix = f"audit:{list_id}:{filter_name}"
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="← Новее", callback_data=f"{prefix}:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(InlineKeyboardButton(text="Старее →", callback_data=f"{prefix}:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    if item_id is not None:
+        back = f"audit_items:{list_id}:{section_id}:0"
+    elif section_id is not None:
+        back = f"audit_sections:{list_id}:0"
+    else:
+        back = f"settings:{list_id}"
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=back)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def audit_sections_keyboard(list_id: int, sections: Sequence[tuple[int, str]], *, page: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=_short(title, 50), callback_data=f"audit_section:{list_id}:{section_id}:0")]
+        for section_id, title in sections[page * 10:(page + 1) * 10]
+    ]
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="← Назад", callback_data=f"audit_sections:{list_id}:{page - 1}"))
+    if (page + 1) * 10 < len(sections):
+        navigation.append(InlineKeyboardButton(text="Дальше →", callback_data=f"audit_sections:{list_id}:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text="Весь журнал", callback_data=f"audit:{list_id}:all:0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def audit_items_keyboard(list_id: int, section_id: int, items: Sequence[tuple[int, str]],
+                         *, page: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=_short(title, 50), callback_data=f"audit_item:{list_id}:{section_id}:{item_id}:0")]
+        for item_id, title in items[page * 10:(page + 1) * 10]
+    ]
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="← Назад", callback_data=f"audit_items:{list_id}:{section_id}:{page - 1}"))
+    if (page + 1) * 10 < len(items):
+        navigation.append(InlineKeyboardButton(text="Дальше →", callback_data=f"audit_items:{list_id}:{section_id}:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text="История раздела", callback_data=f"audit_section:{list_id}:{section_id}:0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def list_mode_keyboard(shopping_list: ShoppingList) -> InlineKeyboardMarkup:

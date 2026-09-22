@@ -44,6 +44,23 @@ async def test_owner_can_manage_shopping_list(session):
     assert shopping_list.title == "Дача"
 
 
+async def test_collapsed_section_preference_requires_access_and_matching_list(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    first = await shopping.create_shopping_list(session, owner_id=100, title="Первый")
+    second = await shopping.create_shopping_list(session, owner_id=100, title="Второй")
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=second.id)
+    other_category = categories[0]
+
+    with pytest.raises(ValidationError):
+        await shopping.set_section_collapsed(session, user_id=100, list_id=first.id,
+                                             category_id=other_category.id, collapsed=True)
+    with pytest.raises(AccessDenied):
+        await shopping.set_section_collapsed(session, user_id=200, list_id=second.id,
+                                             category_id=other_category.id, collapsed=True)
+    assert await shopping.get_collapsed_sections(session, user_id=100, list_id=first.id) == set()
+
+
 async def test_simple_mode_preserves_existing_items_and_money_and_blocks_new_charges(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     await shopping.upsert_user(session, FakeTelegramUser(id=200))

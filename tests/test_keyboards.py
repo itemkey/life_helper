@@ -74,9 +74,25 @@ def test_list_keyboard_groups_items_under_sections_with_each_item_settings():
     rows = keyboard.inline_keyboard
     callbacks = [[button.callback_data for button in row] for row in rows]
     assert callbacks[:6] == [
-        ["shopping_category:10"], ["toggle:20", "item_open:20"], ["add_category:10"],
-        ["shopping_category:11"], ["toggle:21", "item_open:21"], ["add_category:11"],
+        ["section_toggle:1:10", "shopping_category:10"], ["toggle:20", "item_open:20"], ["add_category:10"],
+        ["section_toggle:1:11", "shopping_category:11"], ["toggle:21", "item_open:21"], ["add_category:11"],
     ]
+
+
+def test_collapsed_section_keeps_section_settings_and_full_list_action():
+    shopping_list = ShoppingList(id=1, owner_id=100, title="Дом", prices_enabled=False)
+    category = ShoppingCategory(id=10, list_id=1, title="Продукты", scope="common", position=1)
+    item = ShoppingItem(id=20, list_id=1, category_id=10, text="Молоко", scope="common", is_done=False)
+
+    keyboard = list_keyboard(shopping_list, [item], AccessLevel.owner, user_id=100,
+                             categories=[category], collapsed_category_ids={10})
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert any(button.callback_data == "section_toggle:1:10" and button.text.startswith("▸") for button in buttons)
+    assert any(button.callback_data == "shopping_category:10" for button in buttons)
+    assert any(button.callback_data == "section_toggle_all:1:expand" for button in buttons)
+    assert any(button.callback_data == "list_text:1:0" for button in buttons)
+    assert not any(button.callback_data in {"toggle:20", "item_open:20", "add_category:10"} for button in buttons)
 
 
 def test_simple_mode_hides_money_and_receipts_but_keeps_item_actions():

@@ -11,6 +11,12 @@ from app.services import shopping
 from app.tgbot.states import ShoppingListStates
 from app.tgbot.texts import format_money_final_text, format_money_text
 from app.tgbot.handlers import (
+    _broadcast_public_list_update,
+    callback_audit,
+    callback_audit_item,
+    callback_audit_items,
+    callback_audit_sections,
+    callback_audit_section,
     callback_add_items,
     callback_add_category_items,
     callback_add_common_items,
@@ -58,6 +64,10 @@ from app.tgbot.handlers import (
     callback_receipt_items_done,
     callback_receipt_select,
     callback_refresh_list,
+    callback_open_list,
+    callback_section_toggle,
+    callback_section_toggle_all,
+    callback_list_text,
     callback_private_confirm,
     callback_relink_confirm,
     callback_shopping_category_add_common,
@@ -242,6 +252,36 @@ async def test_rechecking_old_purchase_after_simple_mode_does_not_charge_again(s
     assert query.message.edits
 
 
+async def test_owner_can_open_audit_and_drill_into_section(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    _, categories, _ = await shopping.get_shopping_categories(session, user_id=100, list_id=shopping_list.id)
+    category = next(entry for entry in categories if entry.scope == shopping.ITEM_SCOPE_COMMON)
+    item = (await shopping.add_items(session, user_id=100, list_id=shopping_list.id,
+                                     category_id=category.id, text="Молоко"))[0]
+    await session.commit()
+    message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_audit(FakeCallback(FakeTelegramUser(id=100), f"audit:{shopping_list.id}:all:0", message), session)
+    assert "Журнал · Дом" in message.text
+    assert "Молоко" in message.text
+    await callback_audit_sections(FakeCallback(FakeTelegramUser(id=100),
+                                              f"audit_sections:{shopping_list.id}:0", message), session)
+    assert "История по разделам" in message.text
+    assert any(button.callback_data == f"audit_section:{shopping_list.id}:{category.id}:0"
+               for row in message.reply_markup.inline_keyboard for button in row)
+    await callback_audit_section(FakeCallback(FakeTelegramUser(id=100),
+                                             f"audit_section:{shopping_list.id}:{category.id}:0", message), session)
+    assert "Раздел «Общее» › пункт «Молоко»" in message.text
+    await callback_audit_items(FakeCallback(FakeTelegramUser(id=100),
+                                           f"audit_items:{shopping_list.id}:{category.id}:0", message), session)
+    assert any(button.callback_data == f"audit_item:{shopping_list.id}:{category.id}:{item.id}:0"
+               for row in message.reply_markup.inline_keyboard for button in row)
+    await callback_audit_item(FakeCallback(FakeTelegramUser(id=100),
+                                          f"audit_item:{shopping_list.id}:{category.id}:{item.id}:0", message), session)
+    assert "Пункт «Молоко»" in message.text
+
+
 async def test_refresh_list_edits_message_and_saves_view(session):
     await shopping.upsert_user(session, FakeTelegramUser(id=100))
     shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
@@ -261,6 +301,87 @@ async def test_refresh_list_edits_message_and_saves_view(session):
     assert view_message is not None
     assert view_message.chat_id == 1000
     assert view_message.message_id == 10
+
+
+async def test_section_collapse_is_personal_and_persists_after_reopening(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    item = (await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Молоко"))[0]
+    message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+
+    await callback_section_toggle(
+        FakeCallback(FakeTelegramUser(id=100), f"section_toggle:{shopping_list.id}:{item.category_id}", message),
+        session,
+    )
+    await session.commit()
+    assert not any(button.callback_data == f"toggle:{item.id}" for row in message.reply_markup.inline_keyboard for button in row)
+
+    session_factory = async_sessionmaker(session.bind, expire_on_commit=False)
+    async with session_factory() as reopened:
+        assert await shopping.get_collapsed_sections(reopened, user_id=100, list_id=shopping_list.id) == {item.category_id}
+        assert await shopping.get_collapsed_sections(reopened, user_id=200, list_id=shopping_list.id) == set()
+        await callback_open_list(
+            FakeCallback(FakeTelegramUser(id=100), f"open:{shopping_list.id}", message), reopened
+        )
+        assert not any(button.callback_data == f"toggle:{item.id}" for row in message.reply_markup.inline_keyboard for button in row)
+        await callback_section_toggle_all(
+            FakeCallback(FakeTelegramUser(id=100), f"section_toggle_all:{shopping_list.id}:expand", message), reopened
+        )
+        assert any(button.callback_data == f"toggle:{item.id}" for row in message.reply_markup.inline_keyboard for button in row)
+        await callback_section_toggle_all(
+            FakeCallback(FakeTelegramUser(id=100), f"section_toggle_all:{shopping_list.id}:collapse", message), reopened
+        )
+        assert not any(button.callback_data == f"toggle:{item.id}" for row in message.reply_markup.inline_keyboard for button in row)
+
+
+async def test_public_update_keeps_each_viewers_sections_folded(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    await shopping.upsert_user(session, FakeTelegramUser(id=200))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом")
+    token = await shopping.enable_public_access(session, owner_id=100, list_id=shopping_list.id)
+    await shopping.join_public_list_by_token(session, user_id=200, token=token)
+    item = (await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Молоко"))[0]
+    await shopping.set_section_collapsed(session, user_id=200, list_id=shopping_list.id,
+                                         category_id=item.category_id, collapsed=True)
+    await shopping.save_list_view_message(session, list_id=shopping_list.id, user_id=100, chat_id=1000, message_id=10)
+    await shopping.save_list_view_message(session, list_id=shopping_list.id, user_id=200, chat_id=2000, message_id=20)
+    bot = FakeBot()
+
+    await _broadcast_public_list_update(bot, session, shopping_list.id)
+
+    assert len(bot.edits) == 2
+    by_chat = {edit["chat_id"]: edit for edit in bot.edits}
+    assert any(button.callback_data == f"toggle:{item.id}" for row in by_chat[1000]["reply_markup"].inline_keyboard for button in row)
+    assert not any(button.callback_data == f"toggle:{item.id}" for row in by_chat[2000]["reply_markup"].inline_keyboard for button in row)
+
+
+async def test_text_view_shows_all_sections_even_if_collapsed_and_back_restores_list(session):
+    await shopping.upsert_user(session, FakeTelegramUser(id=100))
+    shopping_list = await shopping.create_shopping_list(session, owner_id=100, title="Дом & семья")
+    common = (await shopping.add_items(session, user_id=100, list_id=shopping_list.id, text="Молоко <2>"))[0]
+    personal = (await shopping.add_items(session, user_id=100, list_id=shopping_list.id,
+                                         text="Книга", scope=shopping.ITEM_SCOPE_PERSONAL))[0]
+    message = FakeEditableMessage(chat=FakeChat(1000), message_id=10)
+    await callback_open_list(FakeCallback(FakeTelegramUser(id=100), f"open:{shopping_list.id}", message), session)
+    await shopping.set_section_collapsed(session, user_id=100, list_id=shopping_list.id,
+                                         category_id=common.category_id, collapsed=True)
+
+    await callback_list_text(FakeCallback(FakeTelegramUser(id=100), f"list_text:{shopping_list.id}:0", message), session)
+
+    assert "Дом &amp; семья" in message.text
+    assert "Молоко &lt;2&gt;" in message.text
+    assert "Книга" in message.text
+    assert message.text.index("Молоко") < message.text.index("Книга")
+    assert await session.get(ListViewMessage, (shopping_list.id, 100)) is None
+    assert [button.callback_data for row in message.reply_markup.inline_keyboard for button in row] == [f"open:{shopping_list.id}"]
+
+    await callback_open_list(FakeCallback(FakeTelegramUser(id=100), f"open:{shopping_list.id}", message), session)
+    assert await session.get(ListViewMessage, (shopping_list.id, 100)) is not None
+    assert any(button.callback_data == f"toggle:{personal.id}" for row in message.reply_markup.inline_keyboard for button in row)
+    assert not any(button.callback_data == f"toggle:{common.id}" for row in message.reply_markup.inline_keyboard for button in row)
 
 
 async def test_members_button_edits_message_with_list_members(session):

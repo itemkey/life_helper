@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -106,6 +106,37 @@ class ShoppingList(TimestampMixin, Base):
         cascade="all, delete-orphan",
         order_by="ExpenseCategory.position",
     )
+    audit_events: Mapped[list[ListAuditEvent]] = relationship(
+        back_populates="shopping_list",
+        cascade="all, delete-orphan",
+    )
+
+
+class ListAuditEvent(Base):
+    __tablename__ = "list_audit_events"
+    __table_args__ = (
+        Index("ix_list_audit_events_list_time", "list_id", "occurred_at", "id"),
+        Index("ix_list_audit_events_hierarchy", "list_id", "subject_type", "section_id", "subject_id"),
+        Index("ix_list_audit_events_previous_section", "list_id", "subject_type", "previous_section_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    list_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("shopping_lists.id", ondelete="CASCADE"), nullable=False
+    )
+    actor_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    subject_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    subject_title: Mapped[str] = mapped_column(String(255), nullable=False)
+    section_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    previous_section_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    section_title: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    action: Mapped[str] = mapped_column(String(255), nullable=False)
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="live", server_default="live")
+
+    shopping_list: Mapped[ShoppingList] = relationship(back_populates="audit_events")
 
 
 class ShoppingItem(TimestampMixin, Base):
@@ -228,6 +259,20 @@ class ListViewMessage(TimestampMixin, Base):
 
     shopping_list: Mapped[ShoppingList] = relationship(back_populates="view_messages")
     user: Mapped[User] = relationship(back_populates="list_view_messages")
+
+
+class CollapsedListSection(Base):
+    __tablename__ = "collapsed_list_sections"
+
+    list_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("shopping_lists.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    category_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("shopping_categories.id", ondelete="CASCADE"), primary_key=True
+    )
 
 
 class ListMember(Base):

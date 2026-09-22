@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import timedelta, timezone
 from html import escape
 
-from app.db.models import Expense, ExpenseCategory, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
+from app.db.models import Expense, ExpenseCategory, ListAuditEvent, ListMember, ShoppingCategory, ShoppingItem, ShoppingList, User
+from app.services.audit import PAGE_SIZE as AUDIT_PAGE_SIZE
 from app.services.access import AccessLevel
 from app.services.shopping import (
     EXPENSE_SOURCE_CASHBOX,
@@ -51,6 +53,84 @@ def format_list_text(
     else:
         lines.append("Пока пусто")
     return "\n".join(lines)
+
+
+def format_full_list_pages(
+    shopping_list: ShoppingList,
+    items: Sequence[ShoppingItem],
+    categories: Sequence[ShoppingCategory],
+    *,
+    user_id: int,
+) -> list[str]:
+    """Render every section and item, splitting only when Telegram's message limit requires it."""
+    remaining = sum(not item.is_done for item in items)
+    mode = "без цен" if shopping_list.prices_enabled is False else "с учётом денег"
+    header = [
+        f"<b>📄 {escape(shopping_list.title)}</b>",
+        f"{mode} · осталось {remaining} из {len(items)}",
+        "",
+    ]
+    groups: list[tuple[str, list[ShoppingItem]]] = []
+    known_ids = {category.id for category in categories}
+    items_by_category: dict[int, list[ShoppingItem]] = {}
+    ungrouped: list[ShoppingItem] = []
+    for item in items:
+        if item.category_id is None or item.category_id not in known_ids:
+            ungrouped.append(item)
+        else:
+            items_by_category.setdefault(item.category_id, []).append(item)
+    for category in sorted(categories, key=lambda entry: (entry.scope != "common", entry.position, entry.id)):
+        category_items = sorted(
+            items_by_category.get(category.id, []),
+            key=lambda entry: (entry.is_done, entry.position, entry.id),
+        )
+        if category.scope == "personal":
+            owner = "мой" if category.owner_id == user_id else (
+                _format_user_name(category.owner) if category.owner is not None else f"ID {category.owner_id}"
+            )
+            heading = f"👤 {escape(category.title)} · {owner}"
+        else:
+            heading = f"📁 {escape(category.title)}"
+        if shopping_list.prices_enabled is not False:
+            heading += f" · {_format_shopping_category_mode(category.accounting_mode)}"
+        groups.append((f"<b>{heading}</b> · {sum(not item.is_done for item in category_items)}/{len(category_items)}", category_items))
+    ungrouped.sort(key=lambda entry: (entry.is_done, entry.position, entry.id))
+    if ungrouped:
+        groups.append(("<b>📁 Без раздела</b>", ungrouped))
+    if not groups:
+        return ["\n".join([*header, "Пока пусто"])]
+
+    pages: list[str] = []
+    lines = header.copy()
+
+    def fits(extra: str) -> bool:
+        return len("\n".join([*lines, extra])) <= 3000
+
+    def new_page() -> None:
+        nonlocal lines
+        pages.append("\n".join(lines).rstrip())
+        lines = header.copy()
+
+    for heading, category_items in groups:
+        if not fits(f"\n{heading}"):
+            new_page()
+        lines.extend(["", heading])
+        if not category_items:
+            if not fits("Пока пусто"):
+                new_page()
+                lines.extend(["", heading])
+            lines.append("Пока пусто")
+            continue
+        for item in category_items:
+            item_line = f"{'✓' if item.is_done else '□'} {escape(item.text)}"
+            if not fits(item_line):
+                new_page()
+                lines.extend(["", heading])
+            lines.append(item_line)
+    pages.append("\n".join(lines).rstrip())
+    if len(pages) > 1:
+        return [f"{page}\n\nСтраница {index} из {len(pages)}" for index, page in enumerate(pages, start=1)]
+    return pages
 
 
 def _format_shopping_category_heading(category: ShoppingCategory) -> str:
@@ -150,6 +230,71 @@ def format_settings_text(shopping_list: ShoppingList) -> str:
         f"Режим: {mode}\n"
         f"Доступ: {visibility}"
     )
+
+
+def _audit_short(value: str, limit: int = 100) -> str:
+    cleaned = " ".join(value.split())
+    escaped = ""
+    for char in cleaned:
+        fragment = escape(char)
+        if len(escaped) + len(fragment) > limit - 1:
+            return escaped + "…"
+        escaped += fragment
+    return escaped
+
+
+def format_audit_text(
+    shopping_list: ShoppingList,
+    entries: Sequence[ListAuditEvent],
+    actors: dict[int, User],
+    *,
+    total: int,
+    page: int,
+    filter_name: str,
+    section_title: str | None = None,
+) -> str:
+    filter_titles = {
+        "all": "Все события", "items": "Разделы и пункты", "money": "Деньги",
+        "people": "Участники и доступ", "list": "Настройки списка",
+    }
+    heading = section_title or filter_titles.get(filter_name, "Все события")
+    lines = [f"<b>Журнал · {escape(shopping_list.title)}</b>", _audit_short(heading),
+             f"Событий: {total} · страница {page + 1} из {max(1, (total + AUDIT_PAGE_SIZE - 1) // AUDIT_PAGE_SIZE)} · время Минска", ""]
+    if not entries:
+        lines.append("Записей пока нет.")
+    last_day = None
+    for entry in entries:
+        at = entry.occurred_at
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        at = at.astimezone(timezone(timedelta(hours=3)))
+        if at.date() != last_day:
+            lines.append(f"<b>{at:%d.%m.%Y}</b>")
+            last_day = at.date()
+        if entry.subject_type == "item":
+            section = _audit_short(entry.section_title or
+                                   (f"Раздел #{entry.section_id}" if entry.section_id else "Без раздела"), 40)
+            path = f"Раздел «{section}» › пункт «{_audit_short(entry.subject_title, 60)}»"
+        elif entry.subject_type == "section":
+            path = f"Раздел «{_audit_short(entry.subject_title, 60)}»"
+        elif entry.subject_type in {"expense", "expense_category", "contribution"}:
+            path = f"Деньги › {_audit_short(entry.subject_title, 60)}"
+        elif entry.subject_type in {"member", "access"}:
+            path = f"Участники › {_audit_short(entry.subject_title, 60)}"
+        else:
+            path = "Настройки списка"
+        actor = actors.get(entry.actor_id) if entry.actor_id is not None else None
+        actor_text = (_audit_short(" ".join(part for part in (actor.first_name, actor.last_name) if part)
+                                   or actor.username or f"ID {actor.id}", 50)
+                      if actor is not None else (f"ID {entry.actor_id}" if entry.actor_id else "неизвестно"))
+        archive = " · архив" if entry.origin == "legacy" else ""
+        lines.append(f"{at:%H:%M} · {actor_text}{archive}\n"
+                     f"↳ {path}\n"
+                     f"   {_audit_short(entry.action, 90)}"
+                     + (f" · {_audit_short(entry.details, 100)}" if entry.details else ""))
+        lines.append("")
+    lines.append("Архив восстановлен из сохранившихся записей. Прежние удаления и промежуточные правки недоступны.")
+    return "\n".join(lines)
 
 
 def _format_expense_title_with_category(expense: object) -> str:

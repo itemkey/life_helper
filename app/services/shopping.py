@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db.models import (
+    CollapsedListSection,
     Contribution,
     Expense,
     ExpenseCategory,
@@ -23,6 +24,7 @@ from app.db.models import (
     User,
 )
 from app.services.access import AccessLevel, require_access
+from app.services import audit
 from app.services.errors import AccessDenied, ListNotFound, ValidationError
 from app.services.tokens import generate_public_token, hash_public_token
 
@@ -185,6 +187,8 @@ async def create_shopping_list(session: AsyncSession, *, owner_id: int, title: s
     )
     session.add(shopping_list)
     await session.flush()
+    audit.add_event(session, list_id=shopping_list.id, actor_id=owner_id, subject_type="list",
+                    subject_id=shopping_list.id, subject_title=shopping_list.title, action="Создан список")
     await _ensure_default_shopping_categories(session, shopping_list)
     return shopping_list
 
@@ -286,6 +290,9 @@ async def _create_default_shopping_category(
     )
     session.add(category)
     await session.flush()
+    audit.add_event(session, list_id=shopping_list.id, actor_id=owner_id or shopping_list.owner_id,
+                    subject_type="section", subject_id=category.id, subject_title=category.title,
+                    action="Создан раздел")
     return category
 
 
@@ -428,6 +435,9 @@ async def create_expense_category(
     )
     session.add(category)
     await session.flush()
+    audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                    subject_type="expense_category", subject_id=category.id,
+                    subject_title=category.title, action="Создана категория трат")
     return category
 
 
@@ -490,6 +500,14 @@ async def delete_expense_category(
 ) -> int:
     shopping_list, category, _ = await get_expense_category(session, user_id=user_id, category_id=category_id)
     _require_prices_enabled(shopping_list)
+    removed_expenses = (await session.scalars(select(Expense).where(
+        Expense.list_id == shopping_list.id, Expense.category_id == category.id
+    ))).all()
+    for expense in removed_expenses:
+        audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                        subject_type="expense", subject_id=expense.id, subject_title=expense.title,
+                        action="Удалена вместе с категорией трат",
+                        details=category.title)
     category_expense_ids = select(Expense.id).where(
         Expense.list_id == shopping_list.id,
         Expense.category_id == category.id,
@@ -708,6 +726,14 @@ async def update_expense_shares(
             share.amount = share_amount
     expense.shares.sort(key=lambda share: share.user_id)
     await session.flush()
+    audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                    subject_type="expense", subject_id=expense.id, subject_title=expense.title,
+                    action="Изменены доли участников",
+                    details=", ".join(
+                        f"{participants_by_id[participant_id].first_name or participant_id}: "
+                        f"{format_money_amount(shares[participant_id], shopping_list.currency)}"
+                        for participant_id in selected_user_ids
+                    ))
     return expense
 
 
@@ -750,6 +776,59 @@ async def get_shopping_categories(
         )
     ).all()
     return shopping_list, categories, level
+
+
+async def get_collapsed_sections(session: AsyncSession, *, user_id: int, list_id: int) -> set[int]:
+    await require_access(session, user_id=user_id, list_id=list_id)
+    category_ids = await session.scalars(
+        select(CollapsedListSection.category_id).where(
+            CollapsedListSection.list_id == list_id,
+            CollapsedListSection.user_id == user_id,
+        )
+    )
+    return set(category_ids.all())
+
+
+async def set_section_collapsed(
+    session: AsyncSession, *, user_id: int, list_id: int, category_id: int, collapsed: bool
+) -> None:
+    await require_access(session, user_id=user_id, list_id=list_id)
+    category = await session.get(ShoppingCategory, category_id)
+    if category is None or category.list_id != list_id:
+        raise ValidationError("Раздел этого списка не найден.")
+    key = (list_id, user_id, category_id)
+    existing = await session.get(CollapsedListSection, key)
+    if collapsed and existing is None:
+        session.add(CollapsedListSection(list_id=list_id, user_id=user_id, category_id=category_id))
+    elif not collapsed and existing is not None:
+        await session.delete(existing)
+    await session.flush()
+
+
+async def set_all_sections_collapsed(
+    session: AsyncSession, *, user_id: int, list_id: int, collapsed: bool
+) -> None:
+    await require_access(session, user_id=user_id, list_id=list_id)
+    if collapsed:
+        category_ids = set((await session.scalars(
+            select(ShoppingCategory.id).where(ShoppingCategory.list_id == list_id)
+        )).all())
+        existing = set((await session.scalars(
+            select(CollapsedListSection.category_id).where(
+                CollapsedListSection.list_id == list_id,
+                CollapsedListSection.user_id == user_id,
+            )
+        )).all())
+        session.add_all(
+            CollapsedListSection(list_id=list_id, user_id=user_id, category_id=category_id)
+            for category_id in category_ids - existing
+        )
+    else:
+        await session.execute(delete(CollapsedListSection).where(
+            CollapsedListSection.list_id == list_id,
+            CollapsedListSection.user_id == user_id,
+        ))
+    await session.flush()
 
 
 async def get_shopping_category(
@@ -843,6 +922,9 @@ async def create_shopping_category(
     )
     session.add(category)
     await session.flush()
+    audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                    subject_type="section", subject_id=category.id, subject_title=category.title,
+                    action="Создан раздел")
     return category
 
 
@@ -1160,6 +1242,10 @@ async def add_items(
         session.add(item)
         items.append(item)
     await session.flush()
+    for item in items:
+        audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                        subject_type="item", subject_id=item.id, subject_title=item.text,
+                        section_id=category.id, section_title=category.title, action="Добавлен пункт")
     return items
 
 
@@ -1225,6 +1311,11 @@ async def unmark_item(
     ]
     if receipt_links:
         raise ValidationError("Эта покупка закрыта чеком. Можно отменить только весь чек целиком.")
+    linked_expenses = (await session.scalars(select(Expense).where(Expense.item_id == item.id))).all()
+    for expense in linked_expenses:
+        audit.add_event(session, list_id=item.list_id, actor_id=user_id,
+                        subject_type="expense", subject_id=expense.id, subject_title=expense.title,
+                        action="Удалена трата после снятия отметки")
     item.is_done = False
     await session.execute(delete(Expense).where(Expense.item_id == item.id))
     await session.flush()
@@ -1239,11 +1330,28 @@ async def set_all_items_done(
     is_done: bool,
 ) -> int:
     shopping_list, _ = await require_access(session, user_id=user_id, list_id=list_id)
+    changed_items = (await session.scalars(
+        select(ShoppingItem).options(selectinload(ShoppingItem.category)).where(
+            ShoppingItem.list_id == shopping_list.id, ShoppingItem.is_done != is_done
+        )
+    )).all()
     await session.execute(
         update(ShoppingItem)
         .where(ShoppingItem.list_id == shopping_list.id)
         .values(is_done=is_done)
     )
+    if changed_items:
+        audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                        subject_type="list", subject_id=shopping_list.id,
+                        subject_title=shopping_list.title,
+                        action="Отмечены все пункты" if is_done else "Сняты отметки со всех пунктов",
+                        details=f"Изменено пунктов: {len(changed_items)}")
+        for item in changed_items:
+            audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                            subject_type="item", subject_id=item.id, subject_title=item.text,
+                            section_id=item.category_id,
+                            section_title=item.category.title if item.category else None,
+                            action="Отмечен" if is_done else "Отметка снята")
     await session.flush()
     return shopping_list.id
 
@@ -1257,6 +1365,17 @@ async def delete_item(
     shopping_list, item, level = await _get_item_with_access(session, user_id=user_id, item_id=item_id)
     _ensure_item_edit_allowed(shopping_list=shopping_list, item=item, user_id=user_id, level=level)
     list_id = item.list_id
+    direct_expenses = (await session.scalars(select(Expense).where(Expense.item_id == item.id))).all()
+    receipt_expenses = (await session.scalars(
+        select(Expense).join(ExpenseItem, ExpenseItem.expense_id == Expense.id)
+        .where(ExpenseItem.item_id == item.id)
+    )).all()
+    linked_expenses = {expense.id: expense for expense in [*direct_expenses, *receipt_expenses]}
+    for expense in linked_expenses.values():
+        audit.add_event(session, list_id=list_id, actor_id=user_id,
+                        subject_type="expense", subject_id=expense.id,
+                        subject_title=expense.title,
+                        action="Связь с пунктом удалена", details=item.text)
     await session.delete(item)
     await session.flush()
     return list_id
@@ -1272,7 +1391,7 @@ async def get_item_view(
 
 
 async def has_recorded_item_purchase(session: AsyncSession, item: ShoppingItem) -> bool:
-    if item.expense_links:
+    if await session.scalar(select(ExpenseItem.item_id).where(ExpenseItem.item_id == item.id)):
         return True
     return bool(await session.scalar(select(Expense.id).where(Expense.item_id == item.id)))
 
@@ -1341,6 +1460,10 @@ async def create_contribution(
     )
     session.add(contribution)
     await session.flush()
+    audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                    subject_type="contribution", subject_id=contribution.id,
+                    subject_title=f"Взнос участника {contributor_id}", action="Добавлен взнос",
+                    details=format_money_amount(contribution.amount, shopping_list.currency))
     return contribution
 
 
@@ -1411,6 +1534,10 @@ async def create_expense(
     for share_user_id, share_amount in shares.items():
         session.add(ExpenseShare(expense_id=expense.id, user_id=share_user_id, amount=share_amount))
     await session.flush()
+    audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                    subject_type="expense", subject_id=expense.id, subject_title=expense.title,
+                    action="Записана трата",
+                    details=format_money_amount(expense.amount, shopping_list.currency))
     return expense
 
 
@@ -1724,7 +1851,54 @@ async def delete_list(
     await session.flush()
 
 
-async def _cleanup_removed_member(session: AsyncSession, *, list_id: int, member_user_id: int) -> None:
+async def _cleanup_removed_member(session: AsyncSession, *, list_id: int, member_user_id: int,
+                                  actor_id: int) -> None:
+    removed_items = (await session.scalars(select(ShoppingItem).options(
+        selectinload(ShoppingItem.category)
+    ).where(
+        ShoppingItem.list_id == list_id, ShoppingItem.scope == ITEM_SCOPE_PERSONAL,
+        ShoppingItem.personal_owner_id == member_user_id,
+    ))).all()
+    for item in removed_items:
+        audit.add_event(session, list_id=list_id, actor_id=actor_id,
+                        subject_type="item", subject_id=item.id, subject_title=item.text,
+                        section_id=item.category_id,
+                        section_title=item.category.title if item.category else None,
+                        action="Удалён при исключении участника")
+    removed_categories = (await session.scalars(select(ShoppingCategory).where(
+        ShoppingCategory.list_id == list_id, ShoppingCategory.scope == ITEM_SCOPE_PERSONAL,
+        ShoppingCategory.owner_id == member_user_id,
+    ))).all()
+    for category in removed_categories:
+        audit.add_event(session, list_id=list_id, actor_id=actor_id,
+                        subject_type="section", subject_id=category.id, subject_title=category.title,
+                        action="Удалён при исключении участника")
+    removed_expenses = (await session.scalars(select(Expense).where(
+        Expense.list_id == list_id, Expense.payer_id == member_user_id,
+    ))).all()
+    for expense in removed_expenses:
+        audit.add_event(session, list_id=list_id, actor_id=actor_id,
+                        subject_type="expense", subject_id=expense.id, subject_title=expense.title,
+                        action="Удалена при исключении участника")
+    removed_contributions = (await session.scalars(select(Contribution).where(
+        Contribution.list_id == list_id, Contribution.user_id == member_user_id,
+    ))).all()
+    for contribution in removed_contributions:
+        audit.add_event(session, list_id=list_id, actor_id=actor_id,
+                        subject_type="contribution", subject_id=contribution.id,
+                        subject_title=f"Взнос участника {member_user_id}",
+                        action="Удалён при исключении участника")
+    affected_shares = (await session.execute(
+        select(Expense, ExpenseShare.amount)
+        .join(ExpenseShare, ExpenseShare.expense_id == Expense.id)
+        .where(Expense.list_id == list_id, Expense.payer_id != member_user_id,
+               ExpenseShare.user_id == member_user_id)
+    )).all()
+    for expense, share_amount in affected_shares:
+        audit.add_event(session, list_id=list_id, actor_id=actor_id,
+                        subject_type="expense", subject_id=expense.id, subject_title=expense.title,
+                        action="Удалена доля исключённого участника",
+                        details=f"Участник {member_user_id}: {share_amount / 100:.2f}")
     expense_ids = select(Expense.id).where(Expense.list_id == list_id)
     paid_expense_ids = select(Expense.id).where(
         Expense.list_id == list_id,
@@ -1785,7 +1959,8 @@ async def remove_list_member(
         raise ListNotFound("Участник не найден.")
 
     await session.delete(membership)
-    await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_user_id)
+    await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_user_id,
+                                  actor_id=owner_id)
     await clear_list_view_message(session, list_id=list_id, user_id=member_user_id)
     await session.flush()
     return shopping_list
@@ -1812,7 +1987,11 @@ async def ban_list_member(
         session.add(ListBannedMember(list_id=list_id, user_id=member_user_id))
 
     await session.delete(membership)
-    await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_user_id)
+    audit.add_event(session, list_id=list_id, actor_id=owner_id, subject_type="member",
+                    subject_id=None, subject_title=f"Участник {member_user_id}",
+                    action="Заблокирован")
+    await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_user_id,
+                                  actor_id=owner_id)
     await clear_list_view_message(session, list_id=list_id, user_id=member_user_id)
     await session.flush()
     return shopping_list
@@ -1842,10 +2021,15 @@ async def enable_public_access(
         return shopping_list.public_token
 
     token = await _unique_public_token(session)
+    was_public = shopping_list.is_public
     shopping_list.is_public = True
     shopping_list.public_token = token
     shopping_list.public_token_hash = hash_public_token(token)
     await session.flush()
+    if regenerate and was_public:
+        audit.add_event(session, list_id=list_id, actor_id=owner_id,
+                        subject_type="access", subject_id=None, subject_title="Ссылка приглашения",
+                        action="Ссылка приглашения заменена")
     return token
 
 
@@ -1863,7 +2047,11 @@ async def disable_public_access(
         await session.scalars(select(ListMember.user_id).where(ListMember.list_id == list_id))
     ).all()
     for member_id in member_ids:
-        await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_id)
+        audit.add_event(session, list_id=list_id, actor_id=owner_id, subject_type="member",
+                        subject_id=None, subject_title=f"Участник {member_id}",
+                        action="Удалён при закрытии доступа")
+        await _cleanup_removed_member(session, list_id=list_id, member_user_id=member_id,
+                                      actor_id=owner_id)
     await session.execute(delete(ListMember).where(ListMember.list_id == list_id))
     await session.execute(
         delete(ListViewMessage).where(
@@ -1903,6 +2091,9 @@ async def join_public_list_by_token(
         if membership is None:
             session.add(ListMember(list_id=shopping_list.id, user_id=user_id))
             await session.flush()
+            audit.add_event(session, list_id=shopping_list.id, actor_id=user_id,
+                            subject_type="member", subject_id=None,
+                            subject_title=f"Участник {user_id}", action="Присоединился к списку")
         await _ensure_personal_shopping_category(session, shopping_list, owner_id=user_id)
     return shopping_list
 
