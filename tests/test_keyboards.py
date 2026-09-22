@@ -63,7 +63,7 @@ def test_list_keyboard_has_categories_and_money_buttons():
     assert any(button.text == "Деньги" and button.callback_data == "money:1" for button in buttons)
 
 
-def test_list_keyboard_groups_items_under_sections_with_each_item_settings():
+def test_list_keyboard_has_one_button_per_section_and_no_item_buttons():
     shopping_list = ShoppingList(id=1, owner_id=100, title="Дом", prices_enabled=True)
     food = ShoppingCategory(id=10, list_id=1, title="Продукты", scope="common", position=1, accounting_mode="per_item")
     trip = ShoppingCategory(id=11, list_id=1, title="Поездка", scope="common", position=2, accounting_mode="checklist")
@@ -73,27 +73,40 @@ def test_list_keyboard_groups_items_under_sections_with_each_item_settings():
     keyboard = list_keyboard(shopping_list, [towel, milk], AccessLevel.owner, user_id=100, categories=[trip, food])
     rows = keyboard.inline_keyboard
     callbacks = [[button.callback_data for button in row] for row in rows]
-    assert callbacks[:4] == [
-        ["ui_separator"], ["shopping_category:10", "section_toggle:1:10"],
-        ["ui_separator"], ["shopping_category:11", "section_toggle:1:11"],
-    ]
+    assert callbacks[:2] == [["shopping_category:10"], ["shopping_category:11"]]
     assert not any(button.callback_data in {"toggle:20", "toggle:21"} for row in rows for button in row)
+    assert not any(button.callback_data.startswith("section_toggle:") or button.callback_data == "ui_separator"
+                   for row in rows for button in row)
 
 
-def test_collapsed_section_keeps_section_settings_and_full_list_action():
+def test_main_keyboard_keeps_actions_without_extra_list_controls():
     shopping_list = ShoppingList(id=1, owner_id=100, title="Дом", prices_enabled=False)
     category = ShoppingCategory(id=10, list_id=1, title="Продукты", scope="common", position=1)
     item = ShoppingItem(id=20, list_id=1, category_id=10, text="Молоко", scope="common", is_done=False)
 
-    keyboard = list_keyboard(shopping_list, [item], AccessLevel.owner, user_id=100,
-                             categories=[category], collapsed_category_ids={10})
+    keyboard = list_keyboard(shopping_list, [item], AccessLevel.owner, user_id=100, categories=[category])
     buttons = [button for row in keyboard.inline_keyboard for button in row]
 
-    assert any(button.callback_data == "section_toggle:1:10" and button.text == "▸" for button in buttons)
     assert any(button.callback_data == "shopping_category:10" for button in buttons)
-    assert any(button.callback_data == "section_toggle_all:1:expand" for button in buttons)
-    assert any(button.callback_data == "list_text:1:0" for button in buttons)
-    assert not any(button.callback_data in {"toggle:20", "item_open:20", "add_category:10"} for button in buttons)
+    assert any(button.callback_data == "settings:1" for button in buttons)
+    assert not any(button.callback_data in {"toggle:20", "item_open:20", "add_category:10", "list_text:1:0"}
+                   for button in buttons)
+
+
+def test_main_keyboard_shows_empty_and_personal_sections_as_single_buttons():
+    shopping_list = ShoppingList(id=1, owner_id=100, title="Дом")
+    common = ShoppingCategory(id=10, list_id=1, title="Продукты", scope="common", position=1)
+    personal = ShoppingCategory(id=11, list_id=1, title="Личное", scope="personal", owner_id=200,
+                                owner=User(id=200, first_name="Анна"), position=2)
+
+    keyboard = list_keyboard(shopping_list, [], AccessLevel.owner, user_id=100,
+                             categories=[common, personal])
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert [button.callback_data for button in buttons if button.callback_data.startswith("shopping_category:")] == [
+        "shopping_category:10", "shopping_category:11"
+    ]
+    assert any(button.text == "👤 Анна: Личное" for button in buttons)
 
 
 def test_simple_mode_hides_money_and_receipts_but_keeps_item_actions():

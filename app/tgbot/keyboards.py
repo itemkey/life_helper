@@ -74,54 +74,23 @@ def list_keyboard(
     level: AccessLevel,
     user_id: int | None = None,
     categories: Sequence[ShoppingCategory] = (),
-    collapsed_category_ids: frozenset[int] | set[int] = frozenset(),
-    visible_category_ids: Sequence[int | None] | None = None,
     page: int = 0,
     total_pages: int = 1,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    items_by_category: dict[int, list[ShoppingItem]] = {}
-    for item in items:
-        if item.category_id is not None:
-            items_by_category.setdefault(item.category_id, []).append(item)
-
     ordered_categories = sorted(categories, key=lambda entry: (entry.scope != "common", entry.position, entry.id))
-    known_ids = {category.id for category in ordered_categories}
-    visible_ids = set(visible_category_ids) if visible_category_ids is not None else None
-    previous_group: tuple[str, int | None] | None = None
     for category in ordered_categories:
-        if visible_ids is not None and category.id not in visible_ids:
-            continue
-        group = (category.scope, category.owner_id if category.scope == "personal" else None)
-        if group != previous_group:
-            if category.scope == "personal":
-                owner = "Мои разделы" if category.owner_id == user_id else (
-                    _user_label(category.owner) if category.owner else f"ID {category.owner_id}"
-                )
-                separator = f"── 👤 {_short(owner, 35)} ──"
-            else:
-                separator = "── Общие разделы ──"
+        if category.scope == "personal":
+            owner = "Мой" if category.owner_id == user_id else (
+                _user_label(category.owner) if category.owner else f"ID {category.owner_id}"
+            )
+            label = f"👤 {_short(owner, 22)}: {_short(category.title, 30)}"
         else:
-            separator = "────────────"
-        rows.append([InlineKeyboardButton(text=separator, callback_data="ui_separator")])
-        previous_group = group
-        category_items = items_by_category.get(category.id, [])
-        is_collapsed = category.id in collapsed_category_ids
-        remaining = sum(not item.is_done for item in category_items)
-        count = f"{remaining}/{len(category_items)}"
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{_short(category.title, max(10, 38 - len(count)))} · {count}",
-                callback_data=f"shopping_category:{category.id}",
-            ),
-            InlineKeyboardButton(text="▸" if is_collapsed else "▾", callback_data=f"section_toggle:{shopping_list.id}:{category.id}"),
-        ])
-    if (visible_ids is None or None in visible_ids) and any(
-        item.category_id is None or item.category_id not in known_ids
-        for item in items
-    ):
-        rows.append([InlineKeyboardButton(text="── Без раздела ──", callback_data="ui_separator")])
-        rows.append([InlineKeyboardButton(text="Открыть пункты без раздела", callback_data=f"uncategorized:{shopping_list.id}")])
+            label = f"📁 {_short(category.title, 52)}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"shopping_category:{category.id}")])
+    known_ids = {category.id for category in ordered_categories}
+    if any(item.category_id is None or item.category_id not in known_ids for item in items):
+        rows.append([InlineKeyboardButton(text="📁 Без раздела", callback_data=f"uncategorized:{shopping_list.id}")])
     if total_pages > 1:
         navigation: list[InlineKeyboardButton] = []
         if page > 0:
@@ -130,17 +99,6 @@ def list_keyboard(
         if page + 1 < total_pages:
             navigation.append(InlineKeyboardButton(text="→", callback_data=f"list_page:{shopping_list.id}:{page + 1}"))
         rows.append(navigation)
-    active_categories = [category for category in ordered_categories if items_by_category.get(category.id)]
-    if active_categories:
-        all_collapsed = all(category.id in collapsed_category_ids for category in active_categories)
-        action = "expand" if all_collapsed else "collapse"
-        label = "Развернуть все" if all_collapsed else "Свернуть все"
-        rows.append([
-            InlineKeyboardButton(text=label, callback_data=f"section_toggle_all:{shopping_list.id}:{action}"),
-            InlineKeyboardButton(text="📄 Весь список", callback_data=f"list_text:{shopping_list.id}:0"),
-        ])
-    else:
-        rows.append([InlineKeyboardButton(text="📄 Весь список", callback_data=f"list_text:{shopping_list.id}:0")])
     rows.append([
         InlineKeyboardButton(text="＋ Добавить пункт", callback_data=f"add:{shopping_list.id}"),
         InlineKeyboardButton(text="Разделы", callback_data=f"shopping_categories:{shopping_list.id}"),

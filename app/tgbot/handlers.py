@@ -73,7 +73,6 @@ from app.tgbot.texts import (
     format_expense_category_text,
     format_expense_management_text,
     format_item_text,
-    format_list_overview_pages,
     format_full_list_pages,
     format_lists_text,
     format_money_final_text,
@@ -224,7 +223,6 @@ async def _show_list(
 ) -> None:
     shopping_list, items, level = await shopping.get_list_view(session, user_id=user_id, list_id=list_id)
     _, categories, _ = await shopping.get_shopping_categories(session, user_id=user_id, list_id=list_id)
-    collapsed = await shopping.get_collapsed_sections(session, user_id=user_id, list_id=list_id)
     if page is None:
         previous = await session.get(ListViewMessage, (list_id, user_id))
         source_message = target.message if _is_callback_target(target) else None
@@ -232,15 +230,12 @@ async def _show_list(
             previous.chat_id, previous.message_id
         )
         page = previous.page if same_view else 0
-    pages = format_list_overview_pages(shopping_list, items, categories, user_id=user_id,
-                                       collapsed_category_ids=collapsed)
+    pages = format_full_list_pages(shopping_list, items, categories, user_id=user_id)
     current_page = min(max(page, 0), len(pages) - 1)
-    overview = pages[current_page]
     sent_message = await _send_or_edit(
         target,
-        overview.text,
+        pages[current_page],
         reply_markup=list_keyboard(shopping_list, items, level, user_id=user_id, categories=categories,
-                                   collapsed_category_ids=collapsed, visible_category_ids=overview.category_ids,
                                    page=current_page, total_pages=len(pages)),
     )
     identity = _message_identity(sent_message)
@@ -705,20 +700,14 @@ async def _broadcast_public_list_update(
 
         level = AccessLevel.owner if view_message.user_id == shopping_list.owner_id else AccessLevel.member
         try:
-            collapsed = await shopping.get_collapsed_sections(
-                session, user_id=view_message.user_id, list_id=list_id
-            )
-            pages = format_list_overview_pages(shopping_list, items, categories,
-                                               user_id=view_message.user_id, collapsed_category_ids=collapsed)
+            pages = format_full_list_pages(shopping_list, items, categories, user_id=view_message.user_id)
             current_page = min(max(view_message.page, 0), len(pages) - 1)
-            overview = pages[current_page]
             await bot.edit_message_text(
-                text=overview.text,
+                text=pages[current_page],
                 chat_id=view_message.chat_id,
                 message_id=view_message.message_id,
                 reply_markup=list_keyboard(shopping_list, items, level, user_id=view_message.user_id,
-                                           categories=categories, collapsed_category_ids=collapsed,
-                                           visible_category_ids=overview.category_ids,
+                                           categories=categories,
                                            page=current_page, total_pages=len(pages)),
             )
             if view_message.page != current_page:
